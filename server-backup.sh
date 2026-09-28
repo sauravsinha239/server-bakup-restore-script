@@ -3,10 +3,11 @@ set -Eeuo pipefail
 umask 077
 
 # Production server disaster-recovery backup.
-# Auto-detects OS, installs missing tools, loads local backup.conf, and prompts for passwords.
+# Auto-detects OS, installs missing tools, loads local backup.conf, 
+# and prompts interactively for usernames (with Enter for default) and passwords.
 # Run as root.
 
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.3.1"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/backup.conf}"
 
@@ -24,7 +25,7 @@ if [[ -f "$CONFIG_FILE" ]]; then
   # shellcheck source=/dev/null
   . "$CONFIG_FILE"
 else
-  log "No config file found at $CONFIG_FILE (using environment/defaults)"
+  log "No config file found at $CONFIG_FILE (using defaults/prompts)"
 fi
 
 BACKUP_ROOT="${BACKUP_ROOT:-/root/server-backups}"
@@ -53,7 +54,35 @@ is_port_open() {
   (exec 3<>"/dev/tcp/${host}/${port}") >/dev/null 2>&1 && { exec 3>&-; exec 3<&-; return 0; } || return 1
 }
 
-prompt_if_empty() {
+# Prompt for username/text with Enter = default value
+prompt_with_default() {
+  local var_name="$1"
+  local prompt_label="$2"
+  local default_val="$3"
+  local current_val="${!var_name:-$default_val}"
+
+  if [[ -t 0 ]]; then
+    local prompt_msg="[PROMPT] Enter ${prompt_label}"
+    if [[ -n "$default_val" ]]; then
+      prompt_msg+=" [default: ${default_val}]"
+    else
+      prompt_msg+=" [press ENTER for none]"
+    fi
+    prompt_msg+=": "
+
+    read -rp "$prompt_msg" user_input
+    if [[ -z "$user_input" ]]; then
+      export "$var_name"="$default_val"
+    else
+      export "$var_name"="$user_input"
+    fi
+  else
+    export "$var_name"="$current_val"
+  fi
+}
+
+# Prompt for password securely (masked)
+prompt_password_if_empty() {
   local var_name="$1"
   local prompt_label="$2"
   local current_val="${!var_name:-}"
@@ -103,7 +132,7 @@ install_standalone_sqlcmd() {
   case "$arch" in
     x86_64)  arch="amd64" ;;
     aarch64) arch="arm64" ;;
-    *) warn "Unsupported architecture for automated sqlcmd install: $arch"; return 1 ;;
+    *) warn "Unsupported architecture for sqlcmd: $arch"; return 1 ;;
   esac
 
   mkdir -p /usr/local/bin
@@ -129,7 +158,7 @@ install_standalone_mongodump() {
   case "$arch" in
     x86_64)  arch="x86_64" ;;
     aarch64) arch="arm64" ;;
-    *) warn "Unsupported architecture for automated mongodump install: $arch"; return 1 ;;
+    *) warn "Unsupported architecture for mongodump: $arch"; return 1 ;;
   esac
 
   mkdir -p /usr/local/bin
@@ -345,17 +374,18 @@ if cmd psql || cmd pg_dumpall || [[ -d /etc/postgresql ]]; then
 
   PG_HOST="${PG_HOST:-127.0.0.1}"
   PG_PORT="${PG_PORT:-5432}"
-  PG_USER="${PG_USER:-postgres}"
 
   if is_port_open "$PG_HOST" "$PG_PORT" || (cmd pg_isready && pg_isready -q 2>/dev/null); then
-    prompt_if_empty "PG_PASSWORD" "PostgreSQL user '${PG_USER}'"
+    # Prompt for PostgreSQL username (Enter = default 'postgres')
+    prompt_with_default "PG_USER" "PostgreSQL username" "${PG_USER:-postgres}"
+    prompt_password_if_empty "PG_PASSWORD" "PostgreSQL user '${PG_USER}'"
 
     export PGHOST="$PG_HOST"
     export PGPORT="$PG_PORT"
     export PGUSER="$PG_USER"
     [[ -n "${PG_PASSWORD:-}" ]] && export PGPASSWORD="$PG_PASSWORD"
 
-    log "Dumping PostgreSQL databases..."
+    log "Dumping PostgreSQL databases (User: $PG_USER)..."
     psql -Atc 'SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY 1;' \
       > "$TREE/POSTGRES/database-list.txt" 2>/dev/null || true
     pg_dumpall --globals-only > "$TREE/POSTGRES/globals.sql" 2>"$TREE/POSTGRES/globals.err" || warn "PostgreSQL globals dump failed"
@@ -383,8 +413,11 @@ if cmd mongodump || cmd mongosh || [[ -d /etc/mongod.conf.d ]] || [[ -f /etc/mon
   MONGO_PORT="${MONGO_PORT:-27017}"
 
   if is_port_open "$MONGO_HOST" "$MONGO_PORT"; then
+    # Prompt for MongoDB username (Enter = empty / no auth)
+    prompt_with_default "MONGO_USER" "MongoDB username" "${MONGO_USER:-}"
+
     if [[ -n "${MONGO_USER:-}" ]]; then
-      prompt_if_empty "MONGO_PASSWORD" "MongoDB user '${MONGO_USER}'"
+      prompt_password_if_empty "MONGO_PASSWORD" "MongoDB user '${MONGO_USER}'"
       AUTH_STR="${MONGO_USER}:${MONGO_PASSWORD}@"
       AUTH_DB_STR="?authSource=${MONGO_AUTH_DB:-admin}"
     else
@@ -420,9 +453,11 @@ if cmd sqlcmd || systemctl list-unit-files 2>/dev/null | grep -q '^mssql-server\
   MSSQL_HOST_CLEAN="${MSSQL_HOST_CLEAN%%:*}"
 
   if is_port_open "$MSSQL_HOST_CLEAN" 1433; then
-    [[ -n "${MSSQL_USER:-}" ]] && prompt_if_empty "MSSQL_PASSWORD" "MSSQL user '${MSSQL_USER}'"
+    # Prompt for MSSQL username (Enter = default 'sa')
+    prompt_with_default "MSSQL_USER" "MSSQL username" "${MSSQL_USER:-sa}"
+    [[ -n "${MSSQL_USER:-}" ]] && prompt_password_if_empty "MSSQL_PASSWORD" "MSSQL user '${MSSQL_USER}'"
 
-    log "Dumping MSSQL databases..."
+    log "Dumping MSSQL databases (User: $MSSQL_USER)..."
     if cmd sqlcmd; then
       SQLCMD_ARGS=(-S "$MSSQL_SERVER")
       [[ -n "${MSSQL_USER:-}" ]] && SQLCMD_ARGS+=(-U "$MSSQL_USER" -P "${MSSQL_PASSWORD:-}")
@@ -506,8 +541,6 @@ copy_if_exists /etc/NetworkManager NETWORK/etc-NetworkManager
 copy_if_exists /etc/letsencrypt SECURITY/etc-letsencrypt
 copy_if_exists /etc/ssl SECURITY/etc-ssl
 copy_if_exists /etc/fail2ban SECURITY/etc-fail2ban
-
-# Copy the backup.conf itself into backup archive
 copy_if_exists "$CONFIG_FILE" SYSTEM/backup.conf
 
 # ---------- Git metadata ----------
