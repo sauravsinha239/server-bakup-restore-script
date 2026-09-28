@@ -7,7 +7,7 @@ umask 077
 # and prompts interactively for usernames (with Enter for default) and passwords.
 # Run as root.
 
-SCRIPT_VERSION="1.3.1"
+SCRIPT_VERSION="1.4.0"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/backup.conf}"
 
@@ -203,14 +203,21 @@ ensure_dependencies() {
   fi
 
   # PostgreSQL client tools
-  if (( need_pg )) && (! cmd psql || ! cmd pg_dumpall); then
+  if (( need_pg )) && (! cmd psql || ! cmd pg_dump || ! cmd pg_dumpall || ! cmd pg_isready); then
     log "PostgreSQL detected. Installing client tools..."
     if [[ "$DETECTED_OS" == "debian-like" ]]; then
       export DEBIAN_FRONTEND=noninteractive
       apt-get update -y && apt-get install -y --no-install-recommends postgresql-client
     elif [[ "$DETECTED_OS" == "arch" ]]; then
-      pacman -Sy --noconfirm --needed postgresql-libs
+      # Arch provides the PostgreSQL client utilities in the postgresql package.
+      pacman -Sy --noconfirm --needed postgresql
+    else
+      die "Unsupported OS for automatic PostgreSQL client installation."
     fi
+  fi
+
+  if (( need_pg )) && (! cmd psql || ! cmd pg_dump || ! cmd pg_dumpall || ! cmd pg_isready); then
+    die "PostgreSQL client tools are incomplete. Required: psql, pg_dump, pg_dumpall, pg_isready."
   fi
 
   # MongoDB tools
@@ -367,7 +374,7 @@ copy_if_exists /var/spool/cron CRON/var-spool-cron
 crontab -l > "$TREE/CRON/root-crontab.txt" 2>/dev/null || true
 
 # ---------- PostgreSQL ----------
-if cmd psql || cmd pg_dumpall || [[ -d /etc/postgresql ]]; then
+if cmd psql || cmd pg_dump || cmd pg_dumpall || [[ -d /etc/postgresql ]]; then
   mkdir -p "$TREE/POSTGRES/databases"
   copy_if_exists /etc/postgresql POSTGRES/etc-postgresql
   copy_if_exists /etc/postgresql-common POSTGRES/etc-postgresql-common
@@ -375,8 +382,11 @@ if cmd psql || cmd pg_dumpall || [[ -d /etc/postgresql ]]; then
   PG_HOST="${PG_HOST:-127.0.0.1}"
   PG_PORT="${PG_PORT:-5432}"
 
-  if is_port_open "$PG_HOST" "$PG_PORT" || (cmd pg_isready && pg_isready -q 2>/dev/null); then
-    # Prompt for PostgreSQL username (Enter = default 'postgres')
+  if ! cmd psql || ! cmd pg_dump || ! cmd pg_dumpall; then
+    die "PostgreSQL backup requested but required tools are missing (psql/pg_dump/pg_dumpall)."
+  fi
+
+  if is_port_open "$PG_HOST" "$PG_PORT" || (cmd pg_isready && pg_isready -h "$PG_HOST" -p "$PG_PORT" -q 2>/dev/null); then
     prompt_with_default "PG_USER" "PostgreSQL username" "${PG_USER:-postgres}"
     prompt_password_if_empty "PG_PASSWORD" "PostgreSQL user '${PG_USER}'"
 
@@ -385,21 +395,39 @@ if cmd psql || cmd pg_dumpall || [[ -d /etc/postgresql ]]; then
     export PGUSER="$PG_USER"
     [[ -n "${PG_PASSWORD:-}" ]] && export PGPASSWORD="$PG_PASSWORD"
 
-    log "Dumping PostgreSQL databases (User: $PG_USER)..."
-    psql -Atc 'SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY 1;' \
-      > "$TREE/POSTGRES/database-list.txt" 2>/dev/null || true
-    pg_dumpall --globals-only > "$TREE/POSTGRES/globals.sql" 2>"$TREE/POSTGRES/globals.err" || warn "PostgreSQL globals dump failed"
+    log "Dumping PostgreSQL database list..."
+    if ! psql -AtX -c 'SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY 1;' \
+      > "$TREE/POSTGRES/database-list.txt"; then
+      die "PostgreSQL database-list query failed. Aborting backup."
+    fi
+
+    log "Dumping PostgreSQL globals..."
+    if ! pg_dumpall --globals-only > "$TREE/POSTGRES/globals.sql" 2>"$TREE/POSTGRES/globals.err"; then
+      die "PostgreSQL globals dump failed. Aborting backup."
+    fi
+
     while IFS= read -r db; do
       [[ -n "$db" ]] || continue
       safe="${db//[^A-Za-z0-9_.-]/_}"
-      if ! pg_dump -Fc --no-owner --no-acl "$db" > "$TREE/POSTGRES/databases/${safe}.dump" 2>"$TREE/POSTGRES/databases/${safe}.err"; then
-        warn "PostgreSQL database dump failed: $db"
+
+      log "PostgreSQL: dumping database '$db'..."
+      if ! pg_dump -Fc --no-owner --no-acl "$db" \
+        > "$TREE/POSTGRES/databases/${safe}.dump" \
+        2> "$TREE/POSTGRES/databases/${safe}.err"; then
+        die "PostgreSQL database dump failed: $db. Aborting backup."
       fi
+
+      [[ -s "$TREE/POSTGRES/databases/${safe}.dump" ]] ||
+        die "PostgreSQL dump is empty: $db. Aborting backup."
+
+      # Remove empty error files to keep the archive clean.
+      [[ ! -s "$TREE/POSTGRES/databases/${safe}.err" ]] &&
+        rm -f "$TREE/POSTGRES/databases/${safe}.err" || true
     done < "$TREE/POSTGRES/database-list.txt"
 
-    unset PGPASSWORD
+    unset PGPASSWORD PGHOST PGPORT PGUSER
   else
-    log "PostgreSQL is not listening on ${PG_HOST}:${PG_PORT}. Skipping live dump."
+    die "PostgreSQL is detected but is not listening on ${PG_HOST}:${PG_PORT}. Aborting backup."
   fi
 fi
 
@@ -451,45 +479,84 @@ if cmd sqlcmd || systemctl list-unit-files 2>/dev/null | grep -q '^mssql-server\
   MSSQL_SERVER="${MSSQL_SERVER:-127.0.0.1,1433}"
   MSSQL_HOST_CLEAN="${MSSQL_SERVER%%,*}"
   MSSQL_HOST_CLEAN="${MSSQL_HOST_CLEAN%%:*}"
+  MSSQL_PORT="${MSSQL_PORT:-1433}"
 
-  if is_port_open "$MSSQL_HOST_CLEAN" 1433; then
-    # Prompt for MSSQL username (Enter = default 'sa')
-    prompt_with_default "MSSQL_USER" "MSSQL username" "${MSSQL_USER:-sa}"
-    [[ -n "${MSSQL_USER:-}" ]] && prompt_password_if_empty "MSSQL_PASSWORD" "MSSQL user '${MSSQL_USER}'"
-
-    log "Dumping MSSQL databases (User: $MSSQL_USER)..."
-    if cmd sqlcmd; then
-      SQLCMD_ARGS=(-S "$MSSQL_SERVER")
-      [[ -n "${MSSQL_USER:-}" ]] && SQLCMD_ARGS+=(-U "$MSSQL_USER" -P "${MSSQL_PASSWORD:-}")
-
-      sqlcmd "${SQLCMD_ARGS[@]}" -Q "SELECT @@VERSION AS version;" > "$TREE/MSSQL/version.txt" 2>&1 || true
-
-      sqlcmd "${SQLCMD_ARGS[@]}" -h -1 -W -Q \
-        "SET NOCOUNT ON; SELECT name FROM sys.databases WHERE database_id > 4 AND state_desc='ONLINE';" \
-        2>/dev/null | sed '/^[[:space:]]*$/d' > "$TREE/MSSQL/database-list.txt" || true
-
-      MSSQL_BACKUP_DIR="${MSSQL_BACKUP_DIR:-/var/opt/mssql/backup}"
-      mkdir -p "$TREE/MSSQL/bak"
-      while IFS= read -r db; do
-        [[ -n "$db" ]] || continue
-        safe="${db//[^A-Za-z0-9_.-]/_}"
-        qdb="${db//\'/\'\'}"
-        bakpath="${MSSQL_BACKUP_DIR}/${safe}-${STAMP}.bak"
-        if ! sqlcmd "${SQLCMD_ARGS[@]}" -b -Q \
-          "BACKUP DATABASE [$qdb] TO DISK=N'$bakpath' WITH INIT, CHECKSUM, COMPRESSION, STATS=5;" \
-          > "$TREE/MSSQL/${safe}-backup.log" 2>&1; then
-          warn "MSSQL backup failed: $db"
-          continue
-        fi
-        if [[ -f "$bakpath" ]]; then
-          cp -a "$bakpath" "$TREE/MSSQL/bak/"
-          rm -f "$bakpath"
-        fi
-      done < "$TREE/MSSQL/database-list.txt"
-    fi
-  else
-    log "MSSQL is not listening on ${MSSQL_HOST_CLEAN}:1433. Skipping live dump."
+  if ! cmd sqlcmd; then
+    die "MSSQL backup requested but sqlcmd is not installed."
   fi
+
+  if ! is_port_open "$MSSQL_HOST_CLEAN" "$MSSQL_PORT"; then
+    die "MSSQL is detected but is not listening on ${MSSQL_HOST_CLEAN}:${MSSQL_PORT}. Aborting backup."
+  fi
+
+  prompt_with_default "MSSQL_USER" "MSSQL username" "${MSSQL_USER:-sa}"
+  [[ -n "${MSSQL_USER:-}" ]] && prompt_password_if_empty "MSSQL_PASSWORD" "MSSQL user '${MSSQL_USER}'"
+
+  SQLCMD_ARGS=(-S "$MSSQL_SERVER" -b)
+  [[ -n "${MSSQL_USER:-}" ]] && SQLCMD_ARGS+=(-U "$MSSQL_USER" -P "${MSSQL_PASSWORD:-}")
+
+  log "Testing MSSQL connection..."
+  if ! sqlcmd "${SQLCMD_ARGS[@]}" -Q "SELECT @@SERVERNAME AS server_name, @@VERSION AS version;" \
+      > "$TREE/MSSQL/version.txt" 2>&1; then
+    die "MSSQL connection/authentication failed. Aborting backup."
+  fi
+
+  log "Getting MSSQL database list..."
+  if ! sqlcmd "${SQLCMD_ARGS[@]}" -h -1 -W -Q \
+      "SET NOCOUNT ON;
+       SELECT name
+       FROM sys.databases
+       WHERE database_id > 4
+         AND state_desc='ONLINE'
+         AND source_database_id IS NULL
+       ORDER BY name;" \
+      2> "$TREE/MSSQL/database-list.err" |
+      sed '/^[[:space:]]*$/d' |
+      sed 's/[[:space:]]*$//' > "$TREE/MSSQL/database-list.txt"; then
+    die "MSSQL database-list query failed. Aborting backup."
+  fi
+
+  [[ -s "$TREE/MSSQL/database-list.txt" ]] ||
+    die "No online user MSSQL databases were found. Aborting backup."
+
+  # SQL Server itself must be able to write this directory.
+  MSSQL_BACKUP_DIR="${MSSQL_BACKUP_DIR:-/var/opt/mssql/backup}"
+  mkdir -p "$MSSQL_BACKUP_DIR"
+  chown mssql:mssql "$MSSQL_BACKUP_DIR" 2>/dev/null || true
+  chmod 700 "$MSSQL_BACKUP_DIR" 2>/dev/null || true
+
+  mkdir -p "$TREE/MSSQL/bak"
+
+  while IFS= read -r db; do
+    [[ -n "$db" ]] || continue
+
+    safe="${db//[^A-Za-z0-9_.-]/_}"
+    # Escape SQL Server identifier closing bracket: ] -> ]]
+    qdb="${db//]/]]}"
+    bakpath="${MSSQL_BACKUP_DIR}/${safe}-${STAMP}.bak"
+
+    log "MSSQL: backing up database '$db'..."
+
+    if ! sqlcmd "${SQLCMD_ARGS[@]}" -Q \
+      "BACKUP DATABASE [$qdb]
+       TO DISK = N'$bakpath'
+       WITH INIT, CHECKSUM, COMPRESSION, STATS=5;
+       RESTORE VERIFYONLY FROM DISK = N'$bakpath';" \
+      > "$TREE/MSSQL/${safe}-backup.log" 2>&1; then
+      die "MSSQL backup/verification failed: $db. Aborting backup."
+    fi
+
+    [[ -s "$bakpath" ]] ||
+      die "MSSQL backup file is missing or empty: $bakpath"
+
+    cp -a "$bakpath" "$TREE/MSSQL/bak/" ||
+      die "Failed to copy MSSQL backup into archive tree: $db"
+
+    rm -f "$bakpath" ||
+      die "Failed to remove temporary MSSQL backup file: $bakpath"
+  done < "$TREE/MSSQL/database-list.txt"
+
+  unset MSSQL_PASSWORD
 fi
 
 # ---------- Docker ----------
@@ -500,8 +567,8 @@ if cmd docker; then
   docker network ls > "$TREE/DOCKER/networks.txt" 2>&1 || true
   docker volume ls > "$TREE/DOCKER/volumes.txt" 2>&1 || true
   docker compose version > "$TREE/DOCKER/compose-version.txt" 2>&1 || true
-  docker inspect $(docker ps -aq) > "$TREE/DOCKER/container-inspect.json" 2>/dev/null || true
-  docker volume inspect $(docker volume ls -q) > "$TREE/DOCKER/volume-inspect.json" 2>/dev/null || true
+  docker ps -aq | xargs -r docker inspect > "$TREE/DOCKER/container-inspect.json" 2>/dev/null || true
+  docker volume ls -q | xargs -r docker volume inspect > "$TREE/DOCKER/volume-inspect.json" 2>/dev/null || true
   mkdir -p "$TREE/DOCKER/volumes"
   while IFS= read -r vol; do
     [[ -n "$vol" ]] || continue
@@ -557,7 +624,7 @@ find /var/www /opt /srv -type d -name .git -prune -print 2>/dev/null |
   echo "UID: $EUID"
   echo
   echo "Detected commands:"
-  for x in nginx psql pg_dump pg_dumpall mongodump mongosh sqlcmd docker cscli ufw dotnet pacman dpkg; do
+  for x in nginx psql pg_dump pg_dumpall pg_isready mongodump mongosh sqlcmd docker cscli ufw dotnet pacman dpkg; do
     printf '%-12s %s\n' "$x" "$(command -v "$x" 2>/dev/null || echo NOT-INSTALLED)"
   done
 } > "$TREE/backup-info.txt"
@@ -572,12 +639,24 @@ log "Creating checksums"
 )
 
 log "Creating archive"
-tar --acls --xattrs --numeric-owner -czf "$ARCHIVE" -C "$WORK" server-backup backup.log
+if ! tar --acls --xattrs --numeric-owner -czf "$ARCHIVE" -C "$WORK" server-backup backup.log; then
+  die "Failed to create backup archive: $ARCHIVE"
+fi
 
-sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+[[ -s "$ARCHIVE" ]] || die "Backup archive is missing or empty: $ARCHIVE"
+
+log "Verifying archive integrity"
+if ! tar -tzf "$ARCHIVE" >/dev/null; then
+  die "Backup archive integrity check failed: $ARCHIVE"
+fi
+
+if ! sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"; then
+  die "Failed to create archive checksum."
+fi
+
 chmod 600 "$ARCHIVE" "${ARCHIVE}.sha256"
 
-# Cleanup working directory
+# Cleanup working directory only after archive verification succeeds.
 rm -rf "$WORK"
 
 # Retention
@@ -587,11 +666,10 @@ for f in "${old[@]:-}"; do
   rm -f -- "$f" "$f.sha256"
 done
 
-log "Backup completed."
+log "Backup completed successfully."
 log "Archive: $ARCHIVE"
 log "Checksum: ${ARCHIVE}.sha256"
 if (( ERRORS > 0 )); then
-  log "Completed with $ERRORS warning(s). Review the backup before relying on it."
-  exit 2
+  log "Completed with $ERRORS non-fatal warning(s). Review backup.log before relying on the backup."
 fi
 exit 0
