@@ -3,10 +3,9 @@ set -Eeuo pipefail
 umask 077
 
 # Production server disaster-recovery backup.
-# Auto-detects OS (Ubuntu/Debian, Arch Linux) and installs missing database tools.
-# Run as root. Review BACKUP_ROOT and DB credentials before first use.
+# Auto-detects OS, installs missing tools, and verifies database availability before dumping.
 
-SCRIPT_VERSION="1.2.1"
+SCRIPT_VERSION="1.2.2"
 BACKUP_ROOT="${BACKUP_ROOT:-/root/server-backups}"
 RETENTION="${RETENTION:-8}"
 STAMP="$(date +%Y-%m-%d_%H%M%S)"
@@ -32,6 +31,11 @@ copy_if_exists() {
   [[ -e "$src" ]] || return 0
   mkdir -p "$(dirname "$TREE/$dst")"
   cp -a "$src" "$TREE/$dst"
+}
+
+is_port_open() {
+  local host="$1" port="$2"
+  (exec 3<>"/dev/tcp/${host}/${port}") >/dev/null 2>&1 && { exec 3>&-; exec 3<&-; return 0; } || return 1
 }
 
 need_root
@@ -62,7 +66,6 @@ fi
 
 log "Detected OS profile: ${DETECTED_OS} (${PRETTY_NAME:-Linux})"
 
-# Install standalone sqlcmd from official GitHub release
 install_standalone_sqlcmd() {
   if cmd sqlcmd; then return 0; fi
   log "Installing standalone go-sqlcmd binary..."
@@ -71,7 +74,7 @@ install_standalone_sqlcmd() {
   case "$arch" in
     x86_64)  arch="amd64" ;;
     aarch64) arch="arm64" ;;
-    *) warn "Unsupported architecture for automated sqlcmd install: $arch"; return 1 ;;
+    *) warn "Unsupported architecture for sqlcmd: $arch"; return 1 ;;
   esac
 
   mkdir -p /usr/local/bin
@@ -83,13 +86,10 @@ install_standalone_sqlcmd() {
     chmod +x /usr/local/bin/sqlcmd
     hash -r 2>/dev/null || true
     log "sqlcmd successfully installed to /usr/local/bin/sqlcmd"
-  else
-    warn "Failed to download standalone sqlcmd release"
   fi
   rm -rf "$tmp_dir"
 }
 
-# Install standalone MongoDB Database Tools from official fastdl release
 install_standalone_mongodump() {
   if cmd mongodump; then return 0; fi
   log "Installing MongoDB Database Tools via official archive..."
@@ -98,7 +98,7 @@ install_standalone_mongodump() {
   case "$arch" in
     x86_64)  arch="x86_64" ;;
     aarch64) arch="arm64" ;;
-    *) warn "Unsupported architecture for automated mongodump install: $arch"; return 1 ;;
+    *) warn "Unsupported architecture for mongodump: $arch"; return 1 ;;
   esac
 
   mkdir -p /usr/local/bin
@@ -113,8 +113,6 @@ install_standalone_mongodump() {
     chmod +x /usr/local/bin/mongodump /usr/local/bin/mongorestore 2>/dev/null || true
     hash -r 2>/dev/null || true
     log "mongodump successfully installed to /usr/local/bin/mongodump"
-  else
-    warn "Failed to download standalone MongoDB tools archive"
   fi
   rm -rf "$tmp_dir"
 }
@@ -122,18 +120,18 @@ install_standalone_mongodump() {
 ensure_dependencies() {
   log "Verifying system requirements and database CLI tools..."
 
+  # Only trigger installations if the actual systemd service is active/enabled
   local need_pg=0 need_mongo=0 need_mssql=0
-  if systemctl list-unit-files 2>/dev/null | grep -qE '^postgres' || [[ -d /etc/postgresql ]] || [[ -d /var/lib/postgresql ]]; then
+  if systemctl is-active --quiet postgresql 2>/dev/null || [[ -d /etc/postgresql ]]; then
     need_pg=1
   fi
-  if systemctl list-unit-files 2>/dev/null | grep -qE '^(mongod|mongodb)' || [[ -f /etc/mongod.conf ]]; then
+  if systemctl is-active --quiet mongod 2>/dev/null || systemctl is-active --quiet mongodb 2>/dev/null || [[ -f /etc/mongod.conf ]]; then
     need_mongo=1
   fi
-  if systemctl list-unit-files 2>/dev/null | grep -qE '^mssql-server' || [[ -d /var/opt/mssql ]]; then
+  if systemctl is-active --quiet mssql-server 2>/dev/null || [[ -d /var/opt/mssql ]]; then
     need_mssql=1
   fi
 
-  # Helper: ensure curl, tar, bzip2, ca-certificates are available
   if ! cmd curl || ! cmd tar || ! cmd bzip2; then
     if [[ "$DETECTED_OS" == "debian-like" ]]; then
       export DEBIAN_FRONTEND=noninteractive
@@ -143,22 +141,18 @@ ensure_dependencies() {
     fi
   fi
 
-  # 1. PostgreSQL tools
   if (( need_pg )) && (! cmd psql || ! cmd pg_dumpall); then
-    log "PostgreSQL detected but dump tools missing. Installing..."
+    log "PostgreSQL detected. Installing postgresql-client..."
     if [[ "$DETECTED_OS" == "debian-like" ]]; then
       export DEBIAN_FRONTEND=noninteractive
       apt-get update -y && apt-get install -y --no-install-recommends postgresql-client
     elif [[ "$DETECTED_OS" == "arch" ]]; then
       pacman -Sy --noconfirm --needed postgresql-libs
-    else
-      warn "Unrecognized OS. Please install postgresql-client manually."
     fi
   fi
 
-  # 2. MongoDB tools (Resolves Ubuntu 24.04 missing mongo-tools)
   if (( need_mongo )) && ! cmd mongodump; then
-    log "MongoDB detected but mongodump is missing. Installing..."
+    log "MongoDB detected. Installing tools..."
     if [[ "$DETECTED_OS" == "debian-like" ]]; then
       export DEBIAN_FRONTEND=noninteractive
       if ! apt-get install -y --no-install-recommends mongodb-org-tools 2>/dev/null && \
@@ -172,16 +166,11 @@ ensure_dependencies() {
     fi
   fi
 
-  # 3. MSSQL tools
   if (( need_mssql )) && ! cmd sqlcmd; then
-    log "MSSQL Server detected but sqlcmd is missing. Installing..."
+    log "MSSQL detected. Installing sqlcmd..."
     if [[ "$DETECTED_OS" == "debian-like" ]]; then
       export DEBIAN_FRONTEND=noninteractive
-      if ! apt-get install -y --no-install-recommends sqlcmd 2>/dev/null; then
-        install_standalone_sqlcmd
-      fi
-    elif [[ "$DETECTED_OS" == "arch" ]]; then
-      install_standalone_sqlcmd
+      apt-get install -y --no-install-recommends sqlcmd 2>/dev/null || install_standalone_sqlcmd
     else
       install_standalone_sqlcmd
     fi
@@ -316,7 +305,11 @@ crontab -l > "$TREE/CRON/root-crontab.txt" 2>/dev/null || true
 # ---------- PostgreSQL ----------
 if cmd psql || cmd pg_dumpall || [[ -d /etc/postgresql ]]; then
   mkdir -p "$TREE/POSTGRES/databases"
-  if cmd psql; then
+  copy_if_exists /etc/postgresql POSTGRES/etc-postgresql
+  copy_if_exists /etc/postgresql-common POSTGRES/etc-postgresql-common
+
+  if cmd pg_isready && pg_isready -q; then
+    log "Dumping PostgreSQL databases..."
     sudo -u postgres psql -Atc 'SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY 1;' \
       > "$TREE/POSTGRES/database-list.txt" 2>/dev/null || true
     sudo -u postgres pg_dumpall --globals-only > "$TREE/POSTGRES/globals.sql" 2>"$TREE/POSTGRES/globals.err" || warn "PostgreSQL globals dump failed"
@@ -327,9 +320,9 @@ if cmd psql || cmd pg_dumpall || [[ -d /etc/postgresql ]]; then
         warn "PostgreSQL database dump failed: $db"
       fi
     done < "$TREE/POSTGRES/database-list.txt"
+  else
+    log "PostgreSQL is not running/ready. Skipping database dump (configs archived)."
   fi
-  copy_if_exists /etc/postgresql POSTGRES/etc-postgresql
-  copy_if_exists /etc/postgresql-common POSTGRES/etc-postgresql-common
 fi
 
 # ---------- MongoDB ----------
@@ -337,17 +330,21 @@ if cmd mongodump || cmd mongosh || [[ -d /etc/mongod.conf.d ]] || [[ -f /etc/mon
   mkdir -p "$TREE/MONGODB"
   copy_if_exists /etc/mongod.conf MONGODB/mongod.conf
   copy_if_exists /etc/mongod.conf.d MONGODB/mongod.conf.d
-  if cmd mongodump; then
-    MONGO_URI="${MONGO_URI:-mongodb://127.0.0.1:27017}"
-    if ! mongodump --uri="$MONGO_URI" --archive="$TREE/MONGODB/mongodb.archive.gz" --gzip; then
-      warn "MongoDB dump failed"
+
+  MONGO_URI="${MONGO_URI:-mongodb://127.0.0.1:27017}"
+  if is_port_open "127.0.0.1" 27017; then
+    log "Dumping MongoDB databases..."
+    if cmd mongodump; then
+      if ! mongodump --uri="$MONGO_URI" --archive="$TREE/MONGODB/mongodb.archive.gz" --gzip; then
+        warn "MongoDB dump failed"
+      fi
+    fi
+    if cmd mongosh; then
+      mongosh --quiet --eval 'db.adminCommand({listDatabases:1}).databases.map(x=>x.name).join("\n")' \
+        > "$TREE/MONGODB/database-list.txt" 2>/dev/null || true
     fi
   else
-    warn "MongoDB detected but mongodump is not installed"
-  fi
-  if cmd mongosh; then
-    mongosh --quiet --eval 'db.adminCommand({listDatabases:1}).databases.map(x=>x.name).join("\n")' \
-      > "$TREE/MONGODB/database-list.txt" 2>/dev/null || true
+    log "MongoDB is not running on 127.0.0.1:27017. Skipping live dump (configs archived)."
   fi
 fi
 
@@ -355,45 +352,51 @@ fi
 if cmd sqlcmd || systemctl list-unit-files 2>/dev/null | grep -q '^mssql-server\.service'; then
   mkdir -p "$TREE/MSSQL"
   systemctl status mssql-server --no-pager --full > "$TREE/MSSQL/service-status.txt" 2>&1 || true
-  if cmd sqlcmd; then
-    sqlcmd -S "${MSSQL_SERVER:-localhost}" \
-      ${MSSQL_USER:+-U "$MSSQL_USER"} \
-      ${MSSQL_PASSWORD:+-P "$MSSQL_PASSWORD"} \
-      -Q "SELECT @@VERSION AS version;" \
-      > "$TREE/MSSQL/version.txt" 2>&1 || true
-
-    SQLCMD_SERVER="${MSSQL_SERVER:-localhost}"
-    SQLCMD_ARGS=(-S "$SQLCMD_SERVER")
-    [[ -n "${MSSQL_USER:-}" ]] && SQLCMD_ARGS+=(-U "$MSSQL_USER" -P "${MSSQL_PASSWORD:-}")
-    sqlcmd "${SQLCMD_ARGS[@]}" -h -1 -W -Q \
-      "SET NOCOUNT ON; SELECT name FROM sys.databases WHERE database_id > 4 AND state_desc='ONLINE';" \
-      2>/dev/null | sed '/^[[:space:]]*$/d' > "$TREE/MSSQL/database-list.txt" || true
-
-    MSSQL_BACKUP_DIR="${MSSQL_BACKUP_DIR:-/var/opt/mssql/backup}"
-    mkdir -p "$TREE/MSSQL/bak"
-    while IFS= read -r db; do
-      [[ -n "$db" ]] || continue
-      safe="${db//[^A-Za-z0-9_.-]/_}"
-      qdb="${db//\'/\'\'}"
-      bakpath="${MSSQL_BACKUP_DIR}/${safe}-${STAMP}.bak"
-      if ! sqlcmd "${SQLCMD_ARGS[@]}" -b -Q \
-        "BACKUP DATABASE [$qdb] TO DISK=N'$bakpath' WITH INIT, CHECKSUM, COMPRESSION, STATS=5;" \
-        > "$TREE/MSSQL/${safe}-backup.log" 2>&1; then
-        warn "MSSQL backup failed: $db"
-        continue
-      fi
-      if [[ -f "$bakpath" ]]; then
-        cp -a "$bakpath" "$TREE/MSSQL/bak/"
-        rm -f "$bakpath"
-      else
-        warn "MSSQL backup file missing: $db"
-      fi
-    done < "$TREE/MSSQL/database-list.txt"
-  else
-    warn "MSSQL detected but sqlcmd is not installed"
-  fi
   copy_if_exists /var/opt/mssql/MSSQL/MSSQL.conf MSSQL/MSSQL.conf
   copy_if_exists /etc/systemd/system/mssql-server.service.d MSSQL/mssql-systemd-override
+
+  MSSQL_HOST="${MSSQL_SERVER:-127.0.0.1}"
+  MSSQL_HOST_CLEAN="${MSSQL_HOST%%,*}"
+  MSSQL_HOST_CLEAN="${MSSQL_HOST_CLEAN%%:*}"
+
+  if is_port_open "$MSSQL_HOST_CLEAN" 1433; then
+    log "Dumping MSSQL databases..."
+    if cmd sqlcmd; then
+      sqlcmd -S "${MSSQL_SERVER:-localhost}" \
+        ${MSSQL_USER:+-U "$MSSQL_USER"} \
+        ${MSSQL_PASSWORD:+-P "$MSSQL_PASSWORD"} \
+        -Q "SELECT @@VERSION AS version;" \
+        > "$TREE/MSSQL/version.txt" 2>&1 || true
+
+      SQLCMD_ARGS=(-S "${MSSQL_SERVER:-localhost}")
+      [[ -n "${MSSQL_USER:-}" ]] && SQLCMD_ARGS+=(-U "$MSSQL_USER" -P "${MSSQL_PASSWORD:-}")
+
+      sqlcmd "${SQLCMD_ARGS[@]}" -h -1 -W -Q \
+        "SET NOCOUNT ON; SELECT name FROM sys.databases WHERE database_id > 4 AND state_desc='ONLINE';" \
+        2>/dev/null | sed '/^[[:space:]]*$/d' > "$TREE/MSSQL/database-list.txt" || true
+
+      MSSQL_BACKUP_DIR="${MSSQL_BACKUP_DIR:-/var/opt/mssql/backup}"
+      mkdir -p "$TREE/MSSQL/bak"
+      while IFS= read -r db; do
+        [[ -n "$db" ]] || continue
+        safe="${db//[^A-Za-z0-9_.-]/_}"
+        qdb="${db//\'/\'\'}"
+        bakpath="${MSSQL_BACKUP_DIR}/${safe}-${STAMP}.bak"
+        if ! sqlcmd "${SQLCMD_ARGS[@]}" -b -Q \
+          "BACKUP DATABASE [$qdb] TO DISK=N'$bakpath' WITH INIT, CHECKSUM, COMPRESSION, STATS=5;" \
+          > "$TREE/MSSQL/${safe}-backup.log" 2>&1; then
+          warn "MSSQL backup failed: $db"
+          continue
+        fi
+        if [[ -f "$bakpath" ]]; then
+          cp -a "$bakpath" "$TREE/MSSQL/bak/"
+          rm -f "$bakpath"
+        fi
+      done < "$TREE/MSSQL/database-list.txt"
+    fi
+  else
+    log "MSSQL is not listening on ${MSSQL_HOST_CLEAN}:1433. Skipping live dump (configs archived)."
+  fi
 fi
 
 # ---------- Docker ----------
@@ -426,8 +429,10 @@ fi
 
 for p in /opt /srv; do
   if [[ -d "$p" ]]; then
-    tar --acls --xattrs --numeric-owner -czf "$TREE/SYSTEM/$(basename "$p").tar.gz" \
-      --exclude='*/node_modules/*' --exclude='*/.git/*' -C / "$p" \
+    base="$(basename "$p")"
+    parent="$(dirname "$p")"
+    tar --acls --xattrs --numeric-owner -czf "$TREE/SYSTEM/${base}.tar.gz" \
+      --exclude='*/node_modules/*' --exclude='*/.git/*' -C "$parent" "$base" \
       || warn "$p backup failed"
   fi
 done
