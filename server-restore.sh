@@ -14,7 +14,7 @@ umask 077
 # - Firewall and SSH restoration are OFF by default.
 # - Temporary extracted files are retained by default.
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.0.1"
 ARCHIVE="${1:-}"
 
 [[ -n "$ARCHIVE" && -f "$ARCHIVE" ]] || {
@@ -188,7 +188,70 @@ install_selected_packages() {
     case "$ID" in
         ubuntu|debian)
             export DEBIAN_FRONTEND=noninteractive
-            apt-get update -y
+
+            # A broken third-party repository must not prevent restoration of
+            # unrelated services. MSSQL is optional, so only require the
+            # Microsoft repository when MSSQL restore is explicitly selected.
+            apt_update_safe() {
+                local microsoft_list=""
+                local disabled_list=""
+
+                if [[ "$RESTORE_MSSQL" != 1 ]]; then
+                    # Temporarily disable Microsoft repositories if their
+                    # signing key/repository is broken. They are not needed
+                    # for WWW/Nginx/PostgreSQL/Mongo/Docker restoration.
+                    while IFS= read -r microsoft_list; do
+                        [[ -f "$microsoft_list" ]] || continue
+                        disabled_list="${microsoft_list}.restore-disabled"
+                        mv "$microsoft_list" "$disabled_list"
+                        log "Temporarily disabled third-party Microsoft repo: $microsoft_list"
+                    done < <(
+                        grep -RIlE 'packages\.microsoft\.com|packages\.microsoft\.com/ubuntu'                             /etc/apt/sources.list /etc/apt/sources.list.d                             2>/dev/null || true
+                    )
+
+                    if ! apt-get update -y; then
+                        # Put repositories back before failing.
+                        while IFS= read -r disabled_list; do
+                            [[ -f "$disabled_list" ]] || continue
+                            mv "$disabled_list" "${disabled_list%.restore-disabled}"
+                        done < <(
+                            find /etc/apt/sources.list.d                                 -maxdepth 1 -type f                                 -name '*.restore-disabled' -print 2>/dev/null
+                        )
+                        die "apt-get update failed."
+                    fi
+
+                    # Re-enable repositories after the package operation.
+                    while IFS= read -r disabled_list; do
+                        [[ -f "$disabled_list" ]] || continue
+                        mv "$disabled_list" "${disabled_list%.restore-disabled}"
+                    done < <(
+                        find /etc/apt/sources.list.d                             -maxdepth 1 -type f                             -name '*.restore-disabled' -print 2>/dev/null
+                    )
+                else
+                    # MSSQL was explicitly selected. Repair the Microsoft
+                    # repository key if the standard key file exists but is
+                    # unreadable or malformed.
+                    local ms_key="/usr/share/keyrings/microsoft-prod.gpg"
+
+                    if [[ -f "$ms_key" ]] && ! gpg --quiet --batch --list-packets "$ms_key" >/dev/null 2>&1; then
+                        log "Existing Microsoft repository key is invalid. Recreating it..."
+                        rm -f "$ms_key"
+                    fi
+
+                    if [[ ! -f "$ms_key" ]]; then
+                        mkdir -p /usr/share/keyrings
+                        curl -fsSL https://packages.microsoft.com/keys/microsoft.asc |
+                            gpg --dearmor --yes -o "$ms_key"
+                        chmod 0644 "$ms_key"
+                    else
+                        chmod 0644 "$ms_key"
+                    fi
+
+                    apt-get update -y
+                fi
+            }
+
+            apt_update_safe
 
             local pkgs=(tar gzip coreutils)
             [[ "$RESTORE_NGINX" == 1 ]]    && pkgs+=(nginx)
