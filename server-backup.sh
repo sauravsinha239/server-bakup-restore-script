@@ -27,11 +27,20 @@ if [[ -f "$CONFIG_FILE" ]]; then
 else
   log "No config file found at $CONFIG_FILE (using defaults/prompts)"
 fi
-BACKUP_ROOT="${BACKUP_ROOT:-$HOME/server-backups}"
+BACKUP_USER="${SUDO_USER:-$USER}"
+BACKUP_HOME="$(getent passwd "$BACKUP_USER" | cut -d: -f6)"
+
+[[ -n "$BACKUP_HOME" && -d "$BACKUP_HOME" ]] ||
+    die "Could not determine home directory for user: $BACKUP_USER"
+
+BACKUP_ROOT="${BACKUP_ROOT:-$BACKUP_HOME/server-backups}"
+BACKUP_ROOT="${BACKUP_ROOT%/}"
 
 RETENTION="${RETENTION:-8}"
+
 STAMP="$(date +%Y-%m-%d_%H%M%S)"
 HOST="$(hostname -s 2>/dev/null || hostname)"
+
 WORK="${BACKUP_ROOT}/.work-${HOST}-${STAMP}"
 TREE="${WORK}/server-backup"
 ARCHIVE="${BACKUP_ROOT}/server-backup-${HOST}-${STAMP}.tar.gz"
@@ -40,6 +49,7 @@ MANIFEST="${TREE}/MANIFEST.sha256"
 ERRORS=0
 
 mkdir -p "$TREE" "$BACKUP_ROOT"
+
 exec > >(tee -a "$LOG") 2>&1
 copy_if_exists() {
   local src="$1" dst="$2"
