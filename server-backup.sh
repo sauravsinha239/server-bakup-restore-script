@@ -27,13 +27,8 @@ if [[ -f "$CONFIG_FILE" ]]; then
 else
   log "No config file found at $CONFIG_FILE (using defaults/prompts)"
 fi
+BACKUP_ROOT="${BACKUP_ROOT:-$HOME/server-backups}"
 
-BACKUP_ROOT="${BACKUP_ROOT:-~/server-backups}"
-# Expand a leading ~/ from backup.conf; quoted paths do not shell-expand '~'.
-if [[ "$BACKUP_ROOT" == "~/"* ]]; then
-  BACKUP_ROOT="${HOME:-/root}/${BACKUP_ROOT#~/}"
-fi
-BACKUP_ROOT="${BACKUP_ROOT%/}"
 RETENTION="${RETENTION:-8}"
 STAMP="$(date +%Y-%m-%d_%H%M%S)"
 HOST="$(hostname -s 2>/dev/null || hostname)"
@@ -46,7 +41,6 @@ ERRORS=0
 
 mkdir -p "$TREE" "$BACKUP_ROOT"
 exec > >(tee -a "$LOG") 2>&1
-
 copy_if_exists() {
   local src="$1" dst="$2"
   [[ -e "$src" ]] || return 0
