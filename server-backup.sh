@@ -29,6 +29,11 @@ else
 fi
 
 BACKUP_ROOT="${BACKUP_ROOT:-~/server-backups}"
+# Expand a leading ~/ from backup.conf; quoted paths do not shell-expand '~'.
+if [[ "$BACKUP_ROOT" == "~/"* ]]; then
+  BACKUP_ROOT="${HOME:-/root}/${BACKUP_ROOT#~/}"
+fi
+BACKUP_ROOT="${BACKUP_ROOT%/}"
 RETENTION="${RETENTION:-8}"
 STAMP="$(date +%Y-%m-%d_%H%M%S)"
 HOST="$(hostname -s 2>/dev/null || hostname)"
@@ -255,6 +260,7 @@ ensure_dependencies
 # ========================================================
 log "Starting server backup v${SCRIPT_VERSION}"
 log "Host: $HOST"
+log "Backup root: $BACKUP_ROOT"
 log "Archive: $ARCHIVE"
 
 # ---------- System inventory ----------
@@ -508,6 +514,26 @@ if cmd sqlcmd || systemctl list-unit-files 2>/dev/null | grep -q '^mssql-server\
     die "MSSQL connection/authentication failed. Aborting backup."
   fi
 
+  # SQL Server Express does not support BACKUP DATABASE ... COMPRESSION.
+  # Detect the edition once and choose a compatible BACKUP option set.
+  MSSQL_EDITION="$(sqlcmd "${SQLCMD_ARGS[@]}" -h -1 -W -Q \
+    "SET NOCOUNT ON; SELECT CAST(SERVERPROPERTY('Edition') AS nvarchar(256));" \
+    2>>"$TREE/MSSQL/version.txt" | sed '/^[[:space:]]*$/d' | head -n 1 | sed 's/[[:space:]]*$//')"
+
+  [[ -n "$MSSQL_EDITION" ]] ||
+    die "Could not determine SQL Server edition. Aborting backup."
+
+  printf '%s\\n' "$MSSQL_EDITION" > "$TREE/MSSQL/edition.txt"
+  log "MSSQL edition: $MSSQL_EDITION"
+
+  if [[ "$MSSQL_EDITION" == *"Express Edition"* ]]; then
+    MSSQL_BACKUP_OPTIONS="INIT, CHECKSUM, STATS=5"
+    log "SQL Server Express detected: backup compression disabled."
+  else
+    MSSQL_BACKUP_OPTIONS="INIT, CHECKSUM, COMPRESSION, STATS=5"
+    log "SQL Server backup compression enabled."
+  fi
+
   log "Getting MSSQL database list..."
   if ! sqlcmd "${SQLCMD_ARGS[@]}" -h -1 -W -Q \
       "SET NOCOUNT ON;
@@ -544,17 +570,49 @@ if cmd sqlcmd || systemctl list-unit-files 2>/dev/null | grep -q '^mssql-server\
 
     log "MSSQL: backing up database '$db'..."
 
+    BACKUP_LOG="$TREE/MSSQL/${safe}-backup.log"
+
+    # First verify that SQL Server's service account can write to the
+    # configured backup directory. The backup is executed by SQL Server,
+    # not by the root shell running this script.
+    if command -v sudo >/dev/null 2>&1 && id mssql >/dev/null 2>&1; then
+      if ! sudo -u mssql test -w "$MSSQL_BACKUP_DIR"; then
+        {
+          echo "SQL Server service account 'mssql' cannot write to:"
+          echo "$MSSQL_BACKUP_DIR"
+          echo
+          echo "Fix with:"
+          echo "  chown mssql:mssql '$MSSQL_BACKUP_DIR'"
+          echo "  chmod 700 '$MSSQL_BACKUP_DIR'"
+        } > "$BACKUP_LOG"
+        die "MSSQL backup directory is not writable by the mssql service account: $MSSQL_BACKUP_DIR. See $BACKUP_LOG"
+      fi
+    fi
+
+    log "Executing SQL Server BACKUP DATABASE for '$db'..."
     if ! sqlcmd "${SQLCMD_ARGS[@]}" -Q \
       "BACKUP DATABASE [$qdb]
        TO DISK = N'$bakpath'
-       WITH INIT, CHECKSUM, COMPRESSION, STATS=5;
-       RESTORE VERIFYONLY FROM DISK = N'$bakpath';" \
-      > "$TREE/MSSQL/${safe}-backup.log" 2>&1; then
-      die "MSSQL backup/verification failed: $db. Aborting backup."
+       WITH $MSSQL_BACKUP_OPTIONS;" \
+      > "$BACKUP_LOG" 2>&1; then
+      echo "----- MSSQL ERROR: $db -----" >&2
+      cat "$BACKUP_LOG" >&2 || true
+      echo "----- END MSSQL ERROR -----" >&2
+      die "MSSQL database backup failed: $db. Aborting backup. Full error: $BACKUP_LOG"
     fi
 
     [[ -s "$bakpath" ]] ||
       die "MSSQL backup file is missing or empty: $bakpath"
+
+    log "Verifying MSSQL backup: '$db'..."
+    if ! sqlcmd "${SQLCMD_ARGS[@]}" -Q \
+      "RESTORE VERIFYONLY FROM DISK = N'$bakpath';" \
+      >> "$BACKUP_LOG" 2>&1; then
+      echo "----- MSSQL VERIFY ERROR: $db -----" >&2
+      cat "$BACKUP_LOG" >&2 || true
+      echo "----- END MSSQL VERIFY ERROR -----" >&2
+      die "MSSQL backup verification failed: $db. Aborting backup."
+    fi
 
     cp -a "$bakpath" "$TREE/MSSQL/bak/" ||
       die "Failed to copy MSSQL backup into archive tree: $db"
@@ -629,6 +687,9 @@ find /var/www /opt /srv -type d -name .git -prune -print 2>/dev/null |
   echo "OS Profile: $DETECTED_OS"
   echo "Kernel: $(uname -r)"
   echo "UID: $EUID"
+  if [[ -f "$TREE/MSSQL/edition.txt" ]]; then
+    echo "MSSQL Edition: $(cat "$TREE/MSSQL/edition.txt")"
+  fi
   echo
   echo "Detected commands:"
   for x in nginx psql pg_dump pg_dumpall pg_isready mongodump mongosh sqlcmd docker cscli ufw dotnet pacman dpkg; do
