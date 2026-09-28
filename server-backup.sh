@@ -3,9 +3,30 @@ set -Eeuo pipefail
 umask 077
 
 # Production server disaster-recovery backup.
-# Auto-detects OS, installs missing tools, and verifies database availability before dumping.
+# Auto-detects OS, installs missing tools, loads local backup.conf, and prompts for passwords.
+# Run as root.
 
-SCRIPT_VERSION="1.2.2"
+SCRIPT_VERSION="1.3.0"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/backup.conf}"
+
+log(){ printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
+warn(){ log "WARNING: $*"; ERRORS=$((ERRORS+1)); }
+die(){ log "FATAL: $*"; exit 1; }
+need_root(){ [[ $EUID -eq 0 ]] || die "Run as root."; }
+cmd(){ command -v "$1" >/dev/null 2>&1; }
+
+need_root
+
+# Load local config if present
+if [[ -f "$CONFIG_FILE" ]]; then
+  log "Loading configuration from: $CONFIG_FILE"
+  # shellcheck source=/dev/null
+  . "$CONFIG_FILE"
+else
+  log "No config file found at $CONFIG_FILE (using environment/defaults)"
+fi
+
 BACKUP_ROOT="${BACKUP_ROOT:-/root/server-backups}"
 RETENTION="${RETENTION:-8}"
 STAMP="$(date +%Y-%m-%d_%H%M%S)"
@@ -20,12 +41,6 @@ ERRORS=0
 mkdir -p "$TREE" "$BACKUP_ROOT"
 exec > >(tee -a "$LOG") 2>&1
 
-log(){ printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
-warn(){ log "WARNING: $*"; ERRORS=$((ERRORS+1)); }
-die(){ log "FATAL: $*"; exit 1; }
-need_root(){ [[ $EUID -eq 0 ]] || die "Run as root."; }
-cmd(){ command -v "$1" >/dev/null 2>&1; }
-
 copy_if_exists() {
   local src="$1" dst="$2"
   [[ -e "$src" ]] || return 0
@@ -38,7 +53,21 @@ is_port_open() {
   (exec 3<>"/dev/tcp/${host}/${port}") >/dev/null 2>&1 && { exec 3>&-; exec 3<&-; return 0; } || return 1
 }
 
-need_root
+prompt_if_empty() {
+  local var_name="$1"
+  local prompt_label="$2"
+  local current_val="${!var_name:-}"
+
+  if [[ -z "$current_val" ]]; then
+    if [[ -t 0 ]]; then
+      read -rsp "[PROMPT] Enter password for ${prompt_label}: " user_input
+      echo "" >&2
+      export "$var_name"="$user_input"
+    else
+      warn "Running non-interactively and ${var_name} is unset. Authentication may fail."
+    fi
+  fi
+}
 
 # ========================================================
 # 1. OS Detection and Dependency Provisioning
@@ -74,7 +103,7 @@ install_standalone_sqlcmd() {
   case "$arch" in
     x86_64)  arch="amd64" ;;
     aarch64) arch="arm64" ;;
-    *) warn "Unsupported architecture for sqlcmd: $arch"; return 1 ;;
+    *) warn "Unsupported architecture for automated sqlcmd install: $arch"; return 1 ;;
   esac
 
   mkdir -p /usr/local/bin
@@ -85,7 +114,9 @@ install_standalone_sqlcmd() {
     [[ -f "${tmp_dir}/sqlcmd" ]] && mv "${tmp_dir}/sqlcmd" /usr/local/bin/sqlcmd
     chmod +x /usr/local/bin/sqlcmd
     hash -r 2>/dev/null || true
-    log "sqlcmd successfully installed to /usr/local/bin/sqlcmd"
+    log "sqlcmd installed successfully"
+  else
+    warn "Failed to download standalone sqlcmd release"
   fi
   rm -rf "$tmp_dir"
 }
@@ -98,7 +129,7 @@ install_standalone_mongodump() {
   case "$arch" in
     x86_64)  arch="x86_64" ;;
     aarch64) arch="arm64" ;;
-    *) warn "Unsupported architecture for mongodump: $arch"; return 1 ;;
+    *) warn "Unsupported architecture for automated mongodump install: $arch"; return 1 ;;
   esac
 
   mkdir -p /usr/local/bin
@@ -112,7 +143,9 @@ install_standalone_mongodump() {
     find "${tmp_dir}" -type f -name "mongorestore" -exec cp {} /usr/local/bin/ \; 2>/dev/null || true
     chmod +x /usr/local/bin/mongodump /usr/local/bin/mongorestore 2>/dev/null || true
     hash -r 2>/dev/null || true
-    log "mongodump successfully installed to /usr/local/bin/mongodump"
+    log "mongodump installed successfully"
+  else
+    warn "Failed to download standalone MongoDB tools archive"
   fi
   rm -rf "$tmp_dir"
 }
@@ -120,7 +153,6 @@ install_standalone_mongodump() {
 ensure_dependencies() {
   log "Verifying system requirements and database CLI tools..."
 
-  # Only trigger installations if the actual systemd service is active/enabled
   local need_pg=0 need_mongo=0 need_mssql=0
   if systemctl is-active --quiet postgresql 2>/dev/null || [[ -d /etc/postgresql ]]; then
     need_pg=1
@@ -141,8 +173,9 @@ ensure_dependencies() {
     fi
   fi
 
+  # PostgreSQL client tools
   if (( need_pg )) && (! cmd psql || ! cmd pg_dumpall); then
-    log "PostgreSQL detected. Installing postgresql-client..."
+    log "PostgreSQL detected. Installing client tools..."
     if [[ "$DETECTED_OS" == "debian-like" ]]; then
       export DEBIAN_FRONTEND=noninteractive
       apt-get update -y && apt-get install -y --no-install-recommends postgresql-client
@@ -151,6 +184,7 @@ ensure_dependencies() {
     fi
   fi
 
+  # MongoDB tools
   if (( need_mongo )) && ! cmd mongodump; then
     log "MongoDB detected. Installing tools..."
     if [[ "$DETECTED_OS" == "debian-like" ]]; then
@@ -166,8 +200,9 @@ ensure_dependencies() {
     fi
   fi
 
+  # MSSQL sqlcmd
   if (( need_mssql )) && ! cmd sqlcmd; then
-    log "MSSQL detected. Installing sqlcmd..."
+    log "MSSQL Server detected. Installing sqlcmd..."
     if [[ "$DETECTED_OS" == "debian-like" ]]; then
       export DEBIAN_FRONTEND=noninteractive
       apt-get install -y --no-install-recommends sqlcmd 2>/dev/null || install_standalone_sqlcmd
@@ -308,20 +343,33 @@ if cmd psql || cmd pg_dumpall || [[ -d /etc/postgresql ]]; then
   copy_if_exists /etc/postgresql POSTGRES/etc-postgresql
   copy_if_exists /etc/postgresql-common POSTGRES/etc-postgresql-common
 
-  if cmd pg_isready && pg_isready -q; then
+  PG_HOST="${PG_HOST:-127.0.0.1}"
+  PG_PORT="${PG_PORT:-5432}"
+  PG_USER="${PG_USER:-postgres}"
+
+  if is_port_open "$PG_HOST" "$PG_PORT" || (cmd pg_isready && pg_isready -q 2>/dev/null); then
+    prompt_if_empty "PG_PASSWORD" "PostgreSQL user '${PG_USER}'"
+
+    export PGHOST="$PG_HOST"
+    export PGPORT="$PG_PORT"
+    export PGUSER="$PG_USER"
+    [[ -n "${PG_PASSWORD:-}" ]] && export PGPASSWORD="$PG_PASSWORD"
+
     log "Dumping PostgreSQL databases..."
-    sudo -u postgres psql -Atc 'SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY 1;' \
+    psql -Atc 'SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY 1;' \
       > "$TREE/POSTGRES/database-list.txt" 2>/dev/null || true
-    sudo -u postgres pg_dumpall --globals-only > "$TREE/POSTGRES/globals.sql" 2>"$TREE/POSTGRES/globals.err" || warn "PostgreSQL globals dump failed"
+    pg_dumpall --globals-only > "$TREE/POSTGRES/globals.sql" 2>"$TREE/POSTGRES/globals.err" || warn "PostgreSQL globals dump failed"
     while IFS= read -r db; do
       [[ -n "$db" ]] || continue
       safe="${db//[^A-Za-z0-9_.-]/_}"
-      if ! sudo -u postgres pg_dump -Fc --no-owner --no-acl "$db" > "$TREE/POSTGRES/databases/${safe}.dump" 2>"$TREE/POSTGRES/databases/${safe}.err"; then
+      if ! pg_dump -Fc --no-owner --no-acl "$db" > "$TREE/POSTGRES/databases/${safe}.dump" 2>"$TREE/POSTGRES/databases/${safe}.err"; then
         warn "PostgreSQL database dump failed: $db"
       fi
     done < "$TREE/POSTGRES/database-list.txt"
+
+    unset PGPASSWORD
   else
-    log "PostgreSQL is not running/ready. Skipping database dump (configs archived)."
+    log "PostgreSQL is not listening on ${PG_HOST}:${PG_PORT}. Skipping live dump."
   fi
 fi
 
@@ -331,8 +379,20 @@ if cmd mongodump || cmd mongosh || [[ -d /etc/mongod.conf.d ]] || [[ -f /etc/mon
   copy_if_exists /etc/mongod.conf MONGODB/mongod.conf
   copy_if_exists /etc/mongod.conf.d MONGODB/mongod.conf.d
 
-  MONGO_URI="${MONGO_URI:-mongodb://127.0.0.1:27017}"
-  if is_port_open "127.0.0.1" 27017; then
+  MONGO_HOST="${MONGO_HOST:-127.0.0.1}"
+  MONGO_PORT="${MONGO_PORT:-27017}"
+
+  if is_port_open "$MONGO_HOST" "$MONGO_PORT"; then
+    if [[ -n "${MONGO_USER:-}" ]]; then
+      prompt_if_empty "MONGO_PASSWORD" "MongoDB user '${MONGO_USER}'"
+      AUTH_STR="${MONGO_USER}:${MONGO_PASSWORD}@"
+      AUTH_DB_STR="?authSource=${MONGO_AUTH_DB:-admin}"
+    else
+      AUTH_STR=""
+      AUTH_DB_STR=""
+    fi
+    MONGO_URI="mongodb://${AUTH_STR}${MONGO_HOST}:${MONGO_PORT}/${AUTH_DB_STR}"
+
     log "Dumping MongoDB databases..."
     if cmd mongodump; then
       if ! mongodump --uri="$MONGO_URI" --archive="$TREE/MONGODB/mongodb.archive.gz" --gzip; then
@@ -340,11 +400,11 @@ if cmd mongodump || cmd mongosh || [[ -d /etc/mongod.conf.d ]] || [[ -f /etc/mon
       fi
     fi
     if cmd mongosh; then
-      mongosh --quiet --eval 'db.adminCommand({listDatabases:1}).databases.map(x=>x.name).join("\n")' \
+      mongosh "$MONGO_URI" --quiet --eval 'db.adminCommand({listDatabases:1}).databases.map(x=>x.name).join("\n")' \
         > "$TREE/MONGODB/database-list.txt" 2>/dev/null || true
     fi
   else
-    log "MongoDB is not running on 127.0.0.1:27017. Skipping live dump (configs archived)."
+    log "MongoDB is not listening on ${MONGO_HOST}:${MONGO_PORT}. Skipping live dump."
   fi
 fi
 
@@ -355,21 +415,19 @@ if cmd sqlcmd || systemctl list-unit-files 2>/dev/null | grep -q '^mssql-server\
   copy_if_exists /var/opt/mssql/MSSQL/MSSQL.conf MSSQL/MSSQL.conf
   copy_if_exists /etc/systemd/system/mssql-server.service.d MSSQL/mssql-systemd-override
 
-  MSSQL_HOST="${MSSQL_SERVER:-127.0.0.1}"
-  MSSQL_HOST_CLEAN="${MSSQL_HOST%%,*}"
+  MSSQL_SERVER="${MSSQL_SERVER:-127.0.0.1,1433}"
+  MSSQL_HOST_CLEAN="${MSSQL_SERVER%%,*}"
   MSSQL_HOST_CLEAN="${MSSQL_HOST_CLEAN%%:*}"
 
   if is_port_open "$MSSQL_HOST_CLEAN" 1433; then
+    [[ -n "${MSSQL_USER:-}" ]] && prompt_if_empty "MSSQL_PASSWORD" "MSSQL user '${MSSQL_USER}'"
+
     log "Dumping MSSQL databases..."
     if cmd sqlcmd; then
-      sqlcmd -S "${MSSQL_SERVER:-localhost}" \
-        ${MSSQL_USER:+-U "$MSSQL_USER"} \
-        ${MSSQL_PASSWORD:+-P "$MSSQL_PASSWORD"} \
-        -Q "SELECT @@VERSION AS version;" \
-        > "$TREE/MSSQL/version.txt" 2>&1 || true
-
-      SQLCMD_ARGS=(-S "${MSSQL_SERVER:-localhost}")
+      SQLCMD_ARGS=(-S "$MSSQL_SERVER")
       [[ -n "${MSSQL_USER:-}" ]] && SQLCMD_ARGS+=(-U "$MSSQL_USER" -P "${MSSQL_PASSWORD:-}")
+
+      sqlcmd "${SQLCMD_ARGS[@]}" -Q "SELECT @@VERSION AS version;" > "$TREE/MSSQL/version.txt" 2>&1 || true
 
       sqlcmd "${SQLCMD_ARGS[@]}" -h -1 -W -Q \
         "SET NOCOUNT ON; SELECT name FROM sys.databases WHERE database_id > 4 AND state_desc='ONLINE';" \
@@ -395,7 +453,7 @@ if cmd sqlcmd || systemctl list-unit-files 2>/dev/null | grep -q '^mssql-server\
       done < "$TREE/MSSQL/database-list.txt"
     fi
   else
-    log "MSSQL is not listening on ${MSSQL_HOST_CLEAN}:1433. Skipping live dump (configs archived)."
+    log "MSSQL is not listening on ${MSSQL_HOST_CLEAN}:1433. Skipping live dump."
   fi
 fi
 
@@ -449,7 +507,10 @@ copy_if_exists /etc/letsencrypt SECURITY/etc-letsencrypt
 copy_if_exists /etc/ssl SECURITY/etc-ssl
 copy_if_exists /etc/fail2ban SECURITY/etc-fail2ban
 
-# ---------- Git/deployment metadata ----------
+# Copy the backup.conf itself into backup archive
+copy_if_exists "$CONFIG_FILE" SYSTEM/backup.conf
+
+# ---------- Git metadata ----------
 find /var/www /opt /srv -type d -name .git -prune -print 2>/dev/null |
   sed 's#/.git$##' > "$TREE/SYSTEM/git-repositories.txt" || true
 
