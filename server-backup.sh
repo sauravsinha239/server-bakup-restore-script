@@ -28,7 +28,7 @@ else
   log "No config file found at $CONFIG_FILE (using defaults/prompts)"
 fi
 
-BACKUP_ROOT="${BACKUP_ROOT:-~/server-backups}"
+BACKUP_ROOT="${BACKUP_ROOT:-/root/server-backups}"
 RETENTION="${RETENTION:-8}"
 STAMP="$(date +%Y-%m-%d_%H%M%S)"
 HOST="$(hostname -s 2>/dev/null || hostname)"
@@ -393,10 +393,17 @@ if cmd psql || cmd pg_dump || cmd pg_dumpall || [[ -d /etc/postgresql ]]; then
     export PGHOST="$PG_HOST"
     export PGPORT="$PG_PORT"
     export PGUSER="$PG_USER"
+    export PGDATABASE="${PG_DATABASE:-postgres}"
     [[ -n "${PG_PASSWORD:-}" ]] && export PGPASSWORD="$PG_PASSWORD"
 
-    log "Dumping PostgreSQL database list..."
-    if ! psql -AtX -c 'SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY 1;' \
+    log "Testing PostgreSQL connection..."
+    if ! psql -AtX -d "$PGDATABASE" -c "SELECT 1;" >/dev/null; then
+      die "PostgreSQL authentication/connection failed for user '$PG_USER' using database '$PGDATABASE'. Aborting backup."
+    fi
+
+    log "Dumping ALL PostgreSQL database names..."
+    if ! psql -AtX -d "$PGDATABASE" \
+      -c 'SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY 1;' \
       > "$TREE/POSTGRES/database-list.txt"; then
       die "PostgreSQL database-list query failed. Aborting backup."
     fi
@@ -411,7 +418,7 @@ if cmd psql || cmd pg_dump || cmd pg_dumpall || [[ -d /etc/postgresql ]]; then
       safe="${db//[^A-Za-z0-9_.-]/_}"
 
       log "PostgreSQL: dumping database '$db'..."
-      if ! pg_dump -Fc --no-owner --no-acl "$db" \
+      if ! pg_dump -Fc --no-owner --no-acl -d "$db" \
         > "$TREE/POSTGRES/databases/${safe}.dump" \
         2> "$TREE/POSTGRES/databases/${safe}.err"; then
         die "PostgreSQL database dump failed: $db. Aborting backup."
@@ -425,7 +432,7 @@ if cmd psql || cmd pg_dump || cmd pg_dumpall || [[ -d /etc/postgresql ]]; then
         rm -f "$TREE/POSTGRES/databases/${safe}.err" || true
     done < "$TREE/POSTGRES/database-list.txt"
 
-    unset PGPASSWORD PGHOST PGPORT PGUSER
+    unset PGPASSWORD PGHOST PGPORT PGUSER PGDATABASE
   else
     die "PostgreSQL is detected but is not listening on ${PG_HOST}:${PG_PORT}. Aborting backup."
   fi
@@ -492,7 +499,7 @@ if cmd sqlcmd || systemctl list-unit-files 2>/dev/null | grep -q '^mssql-server\
   prompt_with_default "MSSQL_USER" "MSSQL username" "${MSSQL_USER:-sa}"
   [[ -n "${MSSQL_USER:-}" ]] && prompt_password_if_empty "MSSQL_PASSWORD" "MSSQL user '${MSSQL_USER}'"
 
-  SQLCMD_ARGS=(-S "$MSSQL_SERVER" -b)
+  SQLCMD_ARGS=(-S "$MSSQL_SERVER" -b -C)
   [[ -n "${MSSQL_USER:-}" ]] && SQLCMD_ARGS+=(-U "$MSSQL_USER" -P "${MSSQL_PASSWORD:-}")
 
   log "Testing MSSQL connection..."
@@ -507,7 +514,7 @@ if cmd sqlcmd || systemctl list-unit-files 2>/dev/null | grep -q '^mssql-server\
        SELECT name
        FROM sys.databases
        WHERE database_id > 4
-         AND state_desc='ONLINE'
+         AND state_desc = 'ONLINE'
          AND source_database_id IS NULL
        ORDER BY name;" \
       2> "$TREE/MSSQL/database-list.err" |
