@@ -2,10 +2,10 @@
 set -Eeuo pipefail
 umask 077
 
-# Production server disaster-recovery backup.
+# Production server disaster-recovery backup with OS detection & dependency resolution.
 # Run as root. Review BACKUP_ROOT and DB credentials before first use.
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.2.0"
 BACKUP_ROOT="${BACKUP_ROOT:-/root/server-backups}"
 RETENTION="${RETENTION:-8}"
 STAMP="$(date +%Y-%m-%d_%H%M%S)"
@@ -33,13 +33,142 @@ copy_if_exists() {
   cp -a "$src" "$TREE/$dst"
 }
 
-dump_cmd() {
-  local name="$1"; shift
-  log "Dumping $name"
-  if ! "$@"; then warn "$name dump failed"; return 1; fi
+# ==============================================================================
+# OS Detection & Prerequisite Provisioning
+# ==============================================================================
+detect_os() {
+  if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    OS_ID="${ID:-unknown}"
+    OS_LIKE="${ID_LIKE:-}"
+  else
+    die "Cannot detect operating system (/etc/os-release missing)."
+  fi
+
+  case "$OS_ID" in
+    ubuntu|debian)
+      OS_FAMILY="debian"
+      ;;
+    arch|manjaro|endeavouros)
+      OS_FAMILY="arch"
+      ;;
+    *)
+      if [[ "$OS_LIKE" =~ (ubuntu|debian) ]]; then
+        OS_FAMILY="debian"
+      elif [[ "$OS_LIKE" =~ (arch) ]]; then
+        OS_FAMILY="arch"
+      else
+        die "Unsupported OS family: $OS_ID ($OS_LIKE). Supported: Ubuntu/Debian, Arch Linux."
+      fi
+      ;;
+  esac
+  log "Detected OS: $NAME ($OS_FAMILY family)"
+}
+
+install_missing_tools() {
+  log "Evaluating required dump utilities..."
+
+  # Track if apt-get update or pacman -Sy has been run
+  local pkg_updated=0
+
+  pkg_install() {
+    local pkgs=("$@")
+    if [[ "$OS_FAMILY" == "debian" ]]; then
+      if (( pkg_updated == 0 )); then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -y
+        pkg_updated=1
+      fi
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${pkgs[@]}"
+    elif [[ "$OS_FAMILY" == "arch" ]]; then
+      if (( pkg_updated == 0 )); then
+        pacman -Sy --noconfirm
+        pkg_updated=1
+      fi
+      pacman -S --noconfirm --needed "${pkgs[@]}"
+    fi
+  }
+
+  # 1. Base archive utilities
+  local base_missing=()
+  for c in tar gzip sha256sum; do
+    cmd "$c" || base_missing+=("$c")
+  done
+  if (( ${#base_missing[@]} > 0 )); then
+    log "Installing missing base utilities: ${base_missing[*]}"
+    if [[ "$OS_FAMILY" == "debian" ]]; then
+      pkg_install tar gzip coreutils
+    else
+      pkg_install tar gzip coreutils
+    fi
+  fi
+
+  # 2. PostgreSQL tools: if postgres is present but pg_dump/psql is missing
+  if [[ -d /etc/postgresql ]] || systemctl list-unit-files 2>/dev/null | grep -q '^postgresql'; then
+    if ! cmd pg_dump || ! cmd psql; then
+      log "PostgreSQL service detected without client tools. Installing..."
+      if [[ "$OS_FAMILY" == "debian" ]]; then
+        pkg_install postgresql-client
+      else
+        pkg_install postgresql-libs
+      fi
+    fi
+  fi
+
+  # 3. MongoDB tools: if mongod is present/configured but mongodump is missing
+  if [[ -f /etc/mongod.conf ]] || [[ -d /etc/mongod.conf.d ]] || systemctl list-unit-files 2>/dev/null | grep -q '^mongod'; then
+    if ! cmd mongodump; then
+      log "MongoDB detected without mongodump. Installing mongo-tools..."
+      if [[ "$OS_FAMILY" == "debian" ]]; then
+        pkg_install mongo-tools
+      else
+        # In Arch, official repos package mongo-tools as mongodb-tools
+        pkg_install mongodb-tools || warn "Could not install mongodb-tools via pacman (may require AUR package)."
+      fi
+    fi
+  fi
+
+  # 4. MSSQL tools: if mssql-server is installed/running but sqlcmd is missing
+  if systemctl list-unit-files 2>/dev/null | grep -q '^mssql-server\.service' || [[ -d /var/opt/mssql ]]; then
+    if ! cmd sqlcmd; then
+      log "MSSQL Server detected without sqlcmd. Attempting installation..."
+      if [[ "$OS_FAMILY" == "debian" ]]; then
+        if ! apt-cache show mssql-tools18 >/dev/null 2>&1 && ! apt-cache show mssql-tools >/dev/null 2>&1; then
+          cmd curl || pkg_install curl ca-certificates gnupg
+          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+          curl -fsSL "https://packages.microsoft.com/config/ubuntu/${VERSION_ID:-22.04}/prod.list" \
+            > /etc/apt/sources.list.d/mssql-release.list
+          apt-get update -y
+        fi
+        ACCEPT_EULA=Y apt-get install -y --no-install-recommends mssql-tools18 unixodbc-dev || \
+        ACCEPT_EULA=Y apt-get install -y --no-install-recommends mssql-tools unixodbc-dev || \
+        warn "Could not auto-install mssql-tools via APT."
+      else
+        # Arch official repositories do not maintain mssql-tools; check AUR or go-sqlcmd binary fallback
+        if cmd yay; then
+          yay -S --noconfirm mssql-tools || warn "Failed installing mssql-tools via yay."
+        else
+          warn "Arch Linux requires 'mssql-tools' from the AUR or the standalone sqlcmd utility."
+        fi
+      fi
+
+      # Standardize binary PATH if installed to /opt/mssql-tools*/bin
+      for p in /opt/mssql-tools18/bin /opt/mssql-tools/bin; do
+        if [[ -x "$p/sqlcmd" ]]; then
+          ln -sf "$p/sqlcmd" /usr/local/bin/sqlcmd
+          export PATH="$PATH:$p"
+          break
+        fi
+      done
+    fi
+  fi
 }
 
 need_root
+detect_os
+install_missing_tools
+
 log "Starting server backup v${SCRIPT_VERSION}"
 log "Host: $HOST"
 log "Archive: $ARCHIVE"
@@ -70,6 +199,10 @@ cat /etc/resolv.conf > "$TREE/NETWORK/resolv.conf" 2>/dev/null || true
 if cmd dpkg; then
   dpkg-query -W -f='${binary:Package}\t${Version}\n' | sort > "$TREE/PACKAGES/dpkg-packages.txt" || true
   dpkg --get-selections > "$TREE/PACKAGES/dpkg-selections.txt" || true
+fi
+if cmd pacman; then
+  pacman -Qe > "$TREE/PACKAGES/pacman-explicit.txt" || true
+  pacman -Q > "$TREE/PACKAGES/pacman-all.txt" || true
 fi
 if cmd apt-mark; then apt-mark showmanual > "$TREE/PACKAGES/apt-manual.txt" || true; fi
 if cmd snap; then snap list > "$TREE/PACKAGES/snap-list.txt" || true; fi
@@ -142,8 +275,6 @@ copy_if_exists /usr/lib/systemd/system SYSTEMD/usr-lib-systemd-system
 copy_if_exists /lib/systemd/system SYSTEMD/lib-systemd-system
 copy_if_exists /etc/systemd/user SYSTEMD/etc-systemd-user
 
-# Enabled unit symlinks / custom unit state is covered by /etc/systemd/system.
-# Capture service status for common/installed services.
 systemctl list-units --type=service --all --no-legend 2>/dev/null |
 awk '{print $1}' | while read -r svc; do
   systemctl status "$svc" --no-pager --full > "$TREE/SERVICES/${svc//\//_}.txt" 2>&1 || true
@@ -207,7 +338,6 @@ if cmd sqlcmd || systemctl list-unit-files 2>/dev/null | grep -q '^mssql-server\
       -Q "SELECT @@VERSION AS version;" \
       > "$TREE/MSSQL/version.txt" 2>&1 || true
 
-    # Back up all online user databases through T-SQL -> native .bak.
     SQLCMD_SERVER="${MSSQL_SERVER:-localhost}"
     SQLCMD_ARGS=(-S "$SQLCMD_SERVER")
     [[ -n "${MSSQL_USER:-}" ]] && SQLCMD_ARGS+=(-U "$MSSQL_USER" -P "${MSSQL_PASSWORD:-}")
@@ -220,7 +350,6 @@ if cmd sqlcmd || systemctl list-unit-files 2>/dev/null | grep -q '^mssql-server\
     while IFS= read -r db; do
       [[ -n "$db" ]] || continue
       safe="${db//[^A-Za-z0-9_.-]/_}"
-      # Escape single quotes for T-SQL.
       qdb="${db//\'/\'\'}"
       bakpath="${MSSQL_BACKUP_DIR}/${safe}-${STAMP}.bak"
       if ! sqlcmd "${SQLCMD_ARGS[@]}" -b -Q \
@@ -271,7 +400,6 @@ if [[ -d /var/www ]]; then
     || warn "/var/www backup failed"
 fi
 
-# Capture other common deployment/config locations without copying runtime state.
 for p in /opt /srv; do
   if [[ -d "$p" ]]; then
     tar --acls --xattrs --numeric-owner -czf "$TREE/SYSTEM/$(basename "$p").tar.gz" \
@@ -282,6 +410,8 @@ done
 
 # ---------- Environment/config inventory ----------
 copy_if_exists /etc/apt APT/etc-apt
+copy_if_exists /etc/pacman.d PACMAN/etc-pacman.d
+copy_if_exists /etc/pacman.conf PACMAN/etc-pacman.conf
 copy_if_exists /etc/environment SYSTEM/etc-environment
 copy_if_exists /etc/profile.d SYSTEM/etc-profile.d
 copy_if_exists /etc/sysctl.d SYSTEM/etc-sysctl.d
@@ -300,10 +430,11 @@ find /var/www /opt /srv -type d -name .git -prune -print 2>/dev/null |
   echo "Timestamp: $(date --iso-8601=seconds)"
   echo "Hostname: $HOST"
   echo "Kernel: $(uname -r)"
+  echo "OS Family: $OS_FAMILY"
   echo "UID: $EUID"
   echo
   echo "Detected commands:"
-  for x in nginx psql pg_dump pg_dumpall mongodump mongosh sqlcmd docker cscli ufw dotnet; do
+  for x in nginx psql pg_dump pg_dumpall mongodump mongosh sqlcmd docker cscli ufw pacman dpkg dotnet; do
     printf '%-12s %s\n' "$x" "$(command -v "$x" 2>/dev/null || echo NOT-INSTALLED)"
   done
 } > "$TREE/backup-info.txt"
@@ -323,10 +454,9 @@ tar --acls --xattrs --numeric-owner -czf "$ARCHIVE" -C "$WORK" server-backup bac
 sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
 chmod 600 "$ARCHIVE" "${ARCHIVE}.sha256"
 
-# Cleanup working directory only after successful archive/checksum.
 rm -rf "$WORK"
 
-# Retention: newest RETENTION archives, plus their checksum files.
+# Retention
 mapfile -t old < <(ls -1t "$BACKUP_ROOT"/server-backup-"$HOST"-*.tar.gz 2>/dev/null | tail -n +"$((RETENTION+1))")
 for f in "${old[@]:-}"; do
   [[ -f "$f" ]] || continue
