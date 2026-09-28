@@ -2,10 +2,11 @@
 set -Eeuo pipefail
 umask 077
 
-# Production server disaster-recovery backup with OS detection & dependency resolution.
+# Production server disaster-recovery backup.
+# Auto-detects OS (Ubuntu/Debian, Arch Linux) and installs missing database tools.
 # Run as root. Review BACKUP_ROOT and DB credentials before first use.
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.2.1"
 BACKUP_ROOT="${BACKUP_ROOT:-/root/server-backups}"
 RETENTION="${RETENTION:-8}"
 STAMP="$(date +%Y-%m-%d_%H%M%S)"
@@ -33,142 +34,165 @@ copy_if_exists() {
   cp -a "$src" "$TREE/$dst"
 }
 
-# ==============================================================================
-# OS Detection & Prerequisite Provisioning
-# ==============================================================================
-detect_os() {
-  if [[ -f /etc/os-release ]]; then
-    # shellcheck disable=SC1091
-    source /etc/os-release
-    OS_ID="${ID:-unknown}"
-    OS_LIKE="${ID_LIKE:-}"
-  else
-    die "Cannot detect operating system (/etc/os-release missing)."
-  fi
+need_root
 
-  case "$OS_ID" in
-    ubuntu|debian)
-      OS_FAMILY="debian"
+# ========================================================
+# 1. OS Detection and Dependency Provisioning
+# ========================================================
+DETECTED_OS="unknown"
+if [[ -f /etc/os-release ]]; then
+  # shellcheck source=/dev/null
+  . /etc/os-release
+  case "${ID:-}" in
+    ubuntu|debian|pop|linuxmint)
+      DETECTED_OS="debian-like"
       ;;
     arch|manjaro|endeavouros)
-      OS_FAMILY="arch"
+      DETECTED_OS="arch"
       ;;
     *)
-      if [[ "$OS_LIKE" =~ (ubuntu|debian) ]]; then
-        OS_FAMILY="debian"
-      elif [[ "$OS_LIKE" =~ (arch) ]]; then
-        OS_FAMILY="arch"
-      else
-        die "Unsupported OS family: $OS_ID ($OS_LIKE). Supported: Ubuntu/Debian, Arch Linux."
+      if [[ "${ID_LIKE:-}" =~ (ubuntu|debian) ]]; then
+        DETECTED_OS="debian-like"
+      elif [[ "${ID_LIKE:-}" =~ arch ]]; then
+        DETECTED_OS="arch"
       fi
       ;;
   esac
-  log "Detected OS: $NAME ($OS_FAMILY family)"
+fi
+
+log "Detected OS profile: ${DETECTED_OS} (${PRETTY_NAME:-Linux})"
+
+# Install standalone sqlcmd from official GitHub release
+install_standalone_sqlcmd() {
+  if cmd sqlcmd; then return 0; fi
+  log "Installing standalone go-sqlcmd binary..."
+  local arch
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64)  arch="amd64" ;;
+    aarch64) arch="arm64" ;;
+    *) warn "Unsupported architecture for automated sqlcmd install: $arch"; return 1 ;;
+  esac
+
+  mkdir -p /usr/local/bin
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  if curl -fsSL "https://github.com/microsoft/go-sqlcmd/releases/latest/download/sqlcmd-linux-${arch}.tar.bz2" -o "${tmp_dir}/sqlcmd.tar.bz2"; then
+    tar -xjf "${tmp_dir}/sqlcmd.tar.bz2" -C /usr/local/bin sqlcmd 2>/dev/null || tar -xjf "${tmp_dir}/sqlcmd.tar.bz2" -C "${tmp_dir}"
+    [[ -f "${tmp_dir}/sqlcmd" ]] && mv "${tmp_dir}/sqlcmd" /usr/local/bin/sqlcmd
+    chmod +x /usr/local/bin/sqlcmd
+    hash -r 2>/dev/null || true
+    log "sqlcmd successfully installed to /usr/local/bin/sqlcmd"
+  else
+    warn "Failed to download standalone sqlcmd release"
+  fi
+  rm -rf "$tmp_dir"
 }
 
-install_missing_tools() {
-  log "Evaluating required dump utilities..."
+# Install standalone MongoDB Database Tools from official fastdl release
+install_standalone_mongodump() {
+  if cmd mongodump; then return 0; fi
+  log "Installing MongoDB Database Tools via official archive..."
+  local arch
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64)  arch="x86_64" ;;
+    aarch64) arch="arm64" ;;
+    *) warn "Unsupported architecture for automated mongodump install: $arch"; return 1 ;;
+  esac
 
-  # Track if apt-get update or pacman -Sy has been run
-  local pkg_updated=0
+  mkdir -p /usr/local/bin
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  local url="https://fastdl.mongodb.org/tools/db/mongodb-database-tools-ubuntu2204-${arch}-100.10.0.tgz"
 
-  pkg_install() {
-    local pkgs=("$@")
-    if [[ "$OS_FAMILY" == "debian" ]]; then
-      if (( pkg_updated == 0 )); then
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update -y
-        pkg_updated=1
-      fi
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${pkgs[@]}"
-    elif [[ "$OS_FAMILY" == "arch" ]]; then
-      if (( pkg_updated == 0 )); then
-        pacman -Sy --noconfirm
-        pkg_updated=1
-      fi
-      pacman -S --noconfirm --needed "${pkgs[@]}"
+  if curl -fsSL "$url" -o "${tmp_dir}/tools.tgz"; then
+    tar -xzf "${tmp_dir}/tools.tgz" -C "${tmp_dir}"
+    find "${tmp_dir}" -type f -name "mongodump" -exec cp {} /usr/local/bin/ \;
+    find "${tmp_dir}" -type f -name "mongorestore" -exec cp {} /usr/local/bin/ \; 2>/dev/null || true
+    chmod +x /usr/local/bin/mongodump /usr/local/bin/mongorestore 2>/dev/null || true
+    hash -r 2>/dev/null || true
+    log "mongodump successfully installed to /usr/local/bin/mongodump"
+  else
+    warn "Failed to download standalone MongoDB tools archive"
+  fi
+  rm -rf "$tmp_dir"
+}
+
+ensure_dependencies() {
+  log "Verifying system requirements and database CLI tools..."
+
+  local need_pg=0 need_mongo=0 need_mssql=0
+  if systemctl list-unit-files 2>/dev/null | grep -qE '^postgres' || [[ -d /etc/postgresql ]] || [[ -d /var/lib/postgresql ]]; then
+    need_pg=1
+  fi
+  if systemctl list-unit-files 2>/dev/null | grep -qE '^(mongod|mongodb)' || [[ -f /etc/mongod.conf ]]; then
+    need_mongo=1
+  fi
+  if systemctl list-unit-files 2>/dev/null | grep -qE '^mssql-server' || [[ -d /var/opt/mssql ]]; then
+    need_mssql=1
+  fi
+
+  # Helper: ensure curl, tar, bzip2, ca-certificates are available
+  if ! cmd curl || ! cmd tar || ! cmd bzip2; then
+    if [[ "$DETECTED_OS" == "debian-like" ]]; then
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -y && apt-get install -y --no-install-recommends curl tar bzip2 ca-certificates
+    elif [[ "$DETECTED_OS" == "arch" ]]; then
+      pacman -Sy --noconfirm --needed curl tar bzip2 ca-certificates
     fi
-  }
+  fi
 
-  # 1. Base archive utilities
-  local base_missing=()
-  for c in tar gzip sha256sum; do
-    cmd "$c" || base_missing+=("$c")
-  done
-  if (( ${#base_missing[@]} > 0 )); then
-    log "Installing missing base utilities: ${base_missing[*]}"
-    if [[ "$OS_FAMILY" == "debian" ]]; then
-      pkg_install tar gzip coreutils
+  # 1. PostgreSQL tools
+  if (( need_pg )) && (! cmd psql || ! cmd pg_dumpall); then
+    log "PostgreSQL detected but dump tools missing. Installing..."
+    if [[ "$DETECTED_OS" == "debian-like" ]]; then
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -y && apt-get install -y --no-install-recommends postgresql-client
+    elif [[ "$DETECTED_OS" == "arch" ]]; then
+      pacman -Sy --noconfirm --needed postgresql-libs
     else
-      pkg_install tar gzip coreutils
+      warn "Unrecognized OS. Please install postgresql-client manually."
     fi
   fi
 
-  # 2. PostgreSQL tools: if postgres is present but pg_dump/psql is missing
-  if [[ -d /etc/postgresql ]] || systemctl list-unit-files 2>/dev/null | grep -q '^postgresql'; then
-    if ! cmd pg_dump || ! cmd psql; then
-      log "PostgreSQL service detected without client tools. Installing..."
-      if [[ "$OS_FAMILY" == "debian" ]]; then
-        pkg_install postgresql-client
-      else
-        pkg_install postgresql-libs
+  # 2. MongoDB tools (Resolves Ubuntu 24.04 missing mongo-tools)
+  if (( need_mongo )) && ! cmd mongodump; then
+    log "MongoDB detected but mongodump is missing. Installing..."
+    if [[ "$DETECTED_OS" == "debian-like" ]]; then
+      export DEBIAN_FRONTEND=noninteractive
+      if ! apt-get install -y --no-install-recommends mongodb-org-tools 2>/dev/null && \
+         ! apt-get install -y --no-install-recommends mongodb-database-tools 2>/dev/null; then
+        install_standalone_mongodump
       fi
+    elif [[ "$DETECTED_OS" == "arch" ]]; then
+      pacman -Sy --noconfirm --needed mongodb-tools 2>/dev/null || install_standalone_mongodump
+    else
+      install_standalone_mongodump
     fi
   fi
 
-  # 3. MongoDB tools: if mongod is present/configured but mongodump is missing
-  if [[ -f /etc/mongod.conf ]] || [[ -d /etc/mongod.conf.d ]] || systemctl list-unit-files 2>/dev/null | grep -q '^mongod'; then
-    if ! cmd mongodump; then
-      log "MongoDB detected without mongodump. Installing mongo-tools..."
-      if [[ "$OS_FAMILY" == "debian" ]]; then
-        pkg_install mongo-tools
-      else
-        # In Arch, official repos package mongo-tools as mongodb-tools
-        pkg_install mongodb-tools || warn "Could not install mongodb-tools via pacman (may require AUR package)."
+  # 3. MSSQL tools
+  if (( need_mssql )) && ! cmd sqlcmd; then
+    log "MSSQL Server detected but sqlcmd is missing. Installing..."
+    if [[ "$DETECTED_OS" == "debian-like" ]]; then
+      export DEBIAN_FRONTEND=noninteractive
+      if ! apt-get install -y --no-install-recommends sqlcmd 2>/dev/null; then
+        install_standalone_sqlcmd
       fi
-    fi
-  fi
-
-  # 4. MSSQL tools: if mssql-server is installed/running but sqlcmd is missing
-  if systemctl list-unit-files 2>/dev/null | grep -q '^mssql-server\.service' || [[ -d /var/opt/mssql ]]; then
-    if ! cmd sqlcmd; then
-      log "MSSQL Server detected without sqlcmd. Attempting installation..."
-      if [[ "$OS_FAMILY" == "debian" ]]; then
-        if ! apt-cache show mssql-tools18 >/dev/null 2>&1 && ! apt-cache show mssql-tools >/dev/null 2>&1; then
-          cmd curl || pkg_install curl ca-certificates gnupg
-          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
-          curl -fsSL "https://packages.microsoft.com/config/ubuntu/${VERSION_ID:-22.04}/prod.list" \
-            > /etc/apt/sources.list.d/mssql-release.list
-          apt-get update -y
-        fi
-        ACCEPT_EULA=Y apt-get install -y --no-install-recommends mssql-tools18 unixodbc-dev || \
-        ACCEPT_EULA=Y apt-get install -y --no-install-recommends mssql-tools unixodbc-dev || \
-        warn "Could not auto-install mssql-tools via APT."
-      else
-        # Arch official repositories do not maintain mssql-tools; check AUR or go-sqlcmd binary fallback
-        if cmd yay; then
-          yay -S --noconfirm mssql-tools || warn "Failed installing mssql-tools via yay."
-        else
-          warn "Arch Linux requires 'mssql-tools' from the AUR or the standalone sqlcmd utility."
-        fi
-      fi
-
-      # Standardize binary PATH if installed to /opt/mssql-tools*/bin
-      for p in /opt/mssql-tools18/bin /opt/mssql-tools/bin; do
-        if [[ -x "$p/sqlcmd" ]]; then
-          ln -sf "$p/sqlcmd" /usr/local/bin/sqlcmd
-          export PATH="$PATH:$p"
-          break
-        fi
-      done
+    elif [[ "$DETECTED_OS" == "arch" ]]; then
+      install_standalone_sqlcmd
+    else
+      install_standalone_sqlcmd
     fi
   fi
 }
 
-need_root
-detect_os
-install_missing_tools
+ensure_dependencies
 
+# ========================================================
+# 2. Main Backup Execution
+# ========================================================
 log "Starting server backup v${SCRIPT_VERSION}"
 log "Host: $HOST"
 log "Archive: $ARCHIVE"
@@ -201,8 +225,8 @@ if cmd dpkg; then
   dpkg --get-selections > "$TREE/PACKAGES/dpkg-selections.txt" || true
 fi
 if cmd pacman; then
-  pacman -Qe > "$TREE/PACKAGES/pacman-explicit.txt" || true
-  pacman -Q > "$TREE/PACKAGES/pacman-all.txt" || true
+  pacman -Qe > "$TREE/PACKAGES/pacman-explicit.txt" 2>/dev/null || true
+  pacman -Q > "$TREE/PACKAGES/pacman-all.txt" 2>/dev/null || true
 fi
 if cmd apt-mark; then apt-mark showmanual > "$TREE/PACKAGES/apt-manual.txt" || true; fi
 if cmd snap; then snap list > "$TREE/PACKAGES/snap-list.txt" || true; fi
@@ -410,8 +434,8 @@ done
 
 # ---------- Environment/config inventory ----------
 copy_if_exists /etc/apt APT/etc-apt
-copy_if_exists /etc/pacman.d PACMAN/etc-pacman.d
-copy_if_exists /etc/pacman.conf PACMAN/etc-pacman.conf
+copy_if_exists /etc/pacman.conf SYSTEM/pacman.conf
+copy_if_exists /etc/pacman.d SYSTEM/pacman.d
 copy_if_exists /etc/environment SYSTEM/etc-environment
 copy_if_exists /etc/profile.d SYSTEM/etc-profile.d
 copy_if_exists /etc/sysctl.d SYSTEM/etc-sysctl.d
@@ -429,12 +453,12 @@ find /var/www /opt /srv -type d -name .git -prune -print 2>/dev/null |
   echo "Backup version: $SCRIPT_VERSION"
   echo "Timestamp: $(date --iso-8601=seconds)"
   echo "Hostname: $HOST"
+  echo "OS Profile: $DETECTED_OS"
   echo "Kernel: $(uname -r)"
-  echo "OS Family: $OS_FAMILY"
   echo "UID: $EUID"
   echo
   echo "Detected commands:"
-  for x in nginx psql pg_dump pg_dumpall mongodump mongosh sqlcmd docker cscli ufw pacman dpkg dotnet; do
+  for x in nginx psql pg_dump pg_dumpall mongodump mongosh sqlcmd docker cscli ufw dotnet pacman dpkg; do
     printf '%-12s %s\n' "$x" "$(command -v "$x" 2>/dev/null || echo NOT-INSTALLED)"
   done
 } > "$TREE/backup-info.txt"
@@ -454,6 +478,7 @@ tar --acls --xattrs --numeric-owner -czf "$ARCHIVE" -C "$WORK" server-backup bac
 sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
 chmod 600 "$ARCHIVE" "${ARCHIVE}.sha256"
 
+# Cleanup working directory
 rm -rf "$WORK"
 
 # Retention
