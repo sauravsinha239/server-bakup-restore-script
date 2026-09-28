@@ -28,7 +28,7 @@ else
   log "No config file found at $CONFIG_FILE (using defaults/prompts)"
 fi
 
-BACKUP_ROOT="${BACKUP_ROOT:-/root/server-backups}"
+BACKUP_ROOT="${BACKUP_ROOT:-~/server-backups}"
 RETENTION="${RETENTION:-8}"
 STAMP="$(date +%Y-%m-%d_%H%M%S)"
 HOST="$(hostname -s 2>/dev/null || hostname)"
