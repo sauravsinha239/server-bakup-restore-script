@@ -14,7 +14,7 @@ umask 077
 # - Firewall and SSH restoration are OFF by default in the checkbox menu.
 # - Temporary extracted files are retained by default.
 
-SCRIPT_VERSION="2.6.0"
+SCRIPT_VERSION="2.6.1"
 ARCHIVE="${1:-}"
 
 # Normalize the archive path once so every later operation is independent
@@ -84,6 +84,15 @@ on_error() {
     exit "$rc"
 }
 
+# Cleanup trap for APT repos and file descriptors
+cleanup() {
+    restore_apt_repositories
+    if [[ -n "${TRACE_FILE:-}" && -n "${BASH_XTRACEFD:-}" ]]; then
+        exec {BASH_XTRACEFD}>&- 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+trap 'log "Restore cancelled by user."; exit 130' INT TERM
 trap on_error ERR
 
 cmd() {
@@ -147,13 +156,13 @@ prompt_password() {
     local var_name="$1"
     local label="$2"
     local current="${!var_name:-}"
-    local input
 
     if [[ -n "$current" ]]; then
         return 0
     fi
 
     if [[ -t 0 ]]; then
+        local input
         read -r -s -p "$label password: " input
         echo
         printf -v "$var_name" '%s' "$input"
@@ -166,7 +175,12 @@ menu_checkbox() {
     local title="$1"
     shift
     local -a labels=("$@")
-    local -a selected=("${MENU_SELECTED[@]}")
+    local -a selected=()
+    
+    if [[ ${#MENU_SELECTED[@]} -gt 0 ]]; then
+        selected=("${MENU_SELECTED[@]}")
+    fi
+    
     local cursor=0
     local key seq i mark
 
@@ -181,7 +195,7 @@ menu_checkbox() {
         printf '  ↑/↓  Move    SPACE  Select/Deselect    ENTER  Continue    q  Quit\n\n'
 
         for i in "${!labels[@]}"; do
-            if [[ "${selected[$i]}" == 1 ]]; then
+            if [[ "${selected[$i]:-0}" == 1 ]]; then
                 mark='✓'
             else
                 mark=' '
@@ -213,7 +227,7 @@ menu_checkbox() {
                 esac
                 ;;
             ' ')
-                selected[$cursor]=$((1 - selected[$cursor]))
+                selected[$cursor]=$((1 - ${selected[$cursor]:-0}))
                 ;;
             '')
                 MENU_SELECTED=("${selected[@]}")
@@ -253,21 +267,21 @@ choose_components() {
     MENU_SELECTED=(1 1 1 1 0 1 1 1 0 0)
     menu_checkbox "SELECT RESTORE COMPONENTS" "${labels[@]}"
 
-    RESTORE_WWW="${MENU_SELECTED[0]}"
-    RESTORE_NGINX="${MENU_SELECTED[1]}"
-    RESTORE_POSTGRES="${MENU_SELECTED[2]}"
-    RESTORE_MONGO="${MENU_SELECTED[3]}"
-    RESTORE_MSSQL="${MENU_SELECTED[4]}"
-    RESTORE_SYSTEMD="${MENU_SELECTED[5]}"
-    RESTORE_CROWDSEC="${MENU_SELECTED[6]}"
-    RESTORE_DOCKER="${MENU_SELECTED[7]}"
-    RESTORE_FIREWALL="${MENU_SELECTED[8]}"
-    RESTORE_SSH="${MENU_SELECTED[9]}"
+    RESTORE_WWW="${MENU_SELECTED[0]:-0}"
+    RESTORE_NGINX="${MENU_SELECTED[1]:-0}"
+    RESTORE_POSTGRES="${MENU_SELECTED[2]:-0}"
+    RESTORE_MONGO="${MENU_SELECTED[3]:-0}"
+    RESTORE_MSSQL="${MENU_SELECTED[4]:-0}"
+    RESTORE_SYSTEMD="${MENU_SELECTED[5]:-0}"
+    RESTORE_CROWDSEC="${MENU_SELECTED[6]:-0}"
+    RESTORE_DOCKER="${MENU_SELECTED[7]:-0}"
+    RESTORE_FIREWALL="${MENU_SELECTED[8]:-0}"
+    RESTORE_SSH="${MENU_SELECTED[9]:-0}"
 
     echo
     echo "Selected components:"
     printf '  /var/www                 : %s\n' "$RESTORE_WWW"
-    printf "  Nginx + Let\'s Encrypt     : %s\n" "$RESTORE_NGINX"
+    printf "  Nginx + Let's Encrypt     : %s\n" "$RESTORE_NGINX"
     printf '  PostgreSQL                : %s\n' "$RESTORE_POSTGRES"
     printf '  MongoDB                   : %s\n' "$RESTORE_MONGO"
     printf '  Microsoft SQL Server     : %s\n' "$RESTORE_MSSQL"
@@ -285,9 +299,6 @@ choose_components() {
 
 APT_DISABLED_REPOS=()
 
-# Recover stale repository files left by an interrupted/older restore run.
-# Example: mssql-release.list.restore-disabled.restore-disabled
-# Only recover the original .list/.sources name when that original file is absent.
 recover_stale_apt_repository_files() {
     local f original
     while IFS= read -r -d '' f; do
@@ -301,8 +312,6 @@ recover_stale_apt_repository_files() {
                 mv -f -- "$f" "$original" || warn "Could not recover stale APT repository file: $f"
                 log "Recovered stale Microsoft APT source: $original"
             else
-                # The active source already exists; stale backup is not an active
-                # repository and can safely remain untouched for manual review.
                 log "Leaving stale disabled APT source untouched: $f"
             fi
         fi
@@ -311,7 +320,10 @@ recover_stale_apt_repository_files() {
 
 restore_apt_repositories() {
     local f original
-    for f in "${APT_DISABLED_REPOS[@]:-}"; do
+    if [[ ${#APT_DISABLED_REPOS[@]} -eq 0 ]]; then
+        return 0
+    fi
+    for f in "${APT_DISABLED_REPOS[@]}"; do
         [[ -f "$f" ]] || continue
         original="${f%.restore-disabled}"
         mv -f -- "$f" "$original" || warn "Could not restore APT repository file: $original"
@@ -319,17 +331,12 @@ restore_apt_repositories() {
     APT_DISABLED_REPOS=()
 }
 
-# Always put temporarily disabled repositories back, even if package setup fails.
-trap restore_apt_repositories EXIT
-
 setup_mongodb_apt_repo() {
     local id="$1" version_codename="$2" arch
     arch="$(dpkg --print-architecture)"
 
     case "$id:$version_codename" in
-        ubuntu:noble|ubuntu:jammy|ubuntu:focal)
-            ;;
-        debian:bookworm)
+        ubuntu:noble|ubuntu:jammy|ubuntu:focal|debian:bookworm)
             ;;
         *)
             return 1
@@ -349,16 +356,15 @@ setup_mongodb_apt_repo() {
         cat > "$list_file" <<EOF
 # Managed by server-restore.sh
 # MongoDB Community 8.0 official repository
- deb [ arch=${arch} signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg ] https://repo.mongodb.org/apt/ubuntu ${version_codename}/mongodb-org/8.0 multiverse
+deb [ arch=${arch} signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg ] https://repo.mongodb.org/apt/ubuntu ${version_codename}/mongodb-org/8.0 multiverse
 EOF
     else
         cat > "$list_file" <<EOF
 # Managed by server-restore.sh
 # MongoDB Community 8.0 official repository
- deb [ arch=${arch} signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg ] https://repo.mongodb.org/apt/debian ${version_codename}/mongodb-org/8.0 main
+deb [ arch=${arch} signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg ] https://repo.mongodb.org/apt/debian ${version_codename}/mongodb-org/8.0 main
 EOF
     fi
-    sed -i 's/^ deb/deb/' "$list_file"
     chmod 0644 "$list_file"
     log "MongoDB: official MongoDB 8.0 APT repository configured."
 }
@@ -371,15 +377,13 @@ setup_mssql_apt_repo() {
     cmd curl || apt-get install -y curl
     cmd gpg || apt-get install -y gnupg
 
+    local repo_url
     case "$version_id" in
-        24.04)
-            local repo_url="https://packages.microsoft.com/config/ubuntu/24.04/mssql-server-2025.list"
-            ;;
-        22.04)
-            local repo_url="https://packages.microsoft.com/config/ubuntu/22.04/mssql-server-2025.list"
+        24.04|22.04)
+            repo_url="https://packages.microsoft.com/config/ubuntu/${version_id}/mssql-server-2022.list"
             ;;
         20.04)
-            local repo_url="https://packages.microsoft.com/config/ubuntu/20.04/mssql-server-2022.list"
+            repo_url="https://packages.microsoft.com/config/ubuntu/20.04/mssql-server-2022.list"
             ;;
         *)
             return 1
@@ -406,14 +410,11 @@ install_selected_packages() {
         ubuntu|debian)
             export DEBIAN_FRONTEND=noninteractive
 
-            local microsoft_files=()
+            local -a microsoft_files=()
             local ms_source
 
             recover_stale_apt_repository_files
 
-            # If MSSQL is not selected, temporarily disable only ACTIVE Microsoft
-            # APT sources. Never scan *.restore-disabled* files; those are backup
-            # names and must not be disabled again.
             if [[ "$RESTORE_MSSQL" != 1 ]]; then
                 while IFS= read -r -d '' f; do
                     microsoft_files+=("$f")
@@ -429,13 +430,15 @@ install_selected_packages() {
                     done
                 )
 
-                for f in "${microsoft_files[@]}"; do
-                    [[ -f "$f" ]] || continue
-                    ms_source="${f}.restore-disabled"
-                    mv -f -- "$f" "$ms_source"
-                    APT_DISABLED_REPOS+=("$ms_source")
-                    log "Temporarily disabled Microsoft APT source: $f"
-                done
+                if [[ ${#microsoft_files[@]} -gt 0 ]]; then
+                    for f in "${microsoft_files[@]}"; do
+                        [[ -f "$f" ]] || continue
+                        ms_source="${f}.restore-disabled"
+                        mv -f -- "$f" "$ms_source"
+                        APT_DISABLED_REPOS+=("$ms_source")
+                        log "Temporarily disabled Microsoft APT source: $f"
+                    done
+                fi
             fi
 
             log "Installing/upgrading base restore tools..."
@@ -448,7 +451,6 @@ install_selected_packages() {
             [[ "$RESTORE_SSH" == 1 ]]      && pkgs+=(openssh-server)
             [[ "$RESTORE_FIREWALL" == 1 ]] && pkgs+=(ufw iptables nftables)
 
-            # MongoDB official repository on supported Ubuntu/Debian releases.
             if [[ "$RESTORE_MONGO" == 1 ]]; then
                 if ! cmd mongorestore || ! cmd mongod; then
                     if setup_mongodb_apt_repo "$ID" "${VERSION_CODENAME:-}"; then
@@ -460,7 +462,6 @@ install_selected_packages() {
                 fi
             fi
 
-            # MSSQL official repository + server/tools on supported Ubuntu.
             if [[ "$RESTORE_MSSQL" == 1 ]]; then
                 if [[ "$ID" != "ubuntu" ]]; then
                     die "Automatic fresh MSSQL installation is supported here only on Ubuntu. Install Microsoft SQL Server separately on this OS, then rerun the restore."
@@ -482,8 +483,6 @@ install_selected_packages() {
             log "Installing required restore packages..."
             apt-get install -y "${pkgs[@]}"
 
-            # Ensure command-line database tools are available when the server
-            # packages are already installed but PATH is not configured.
             if [[ "$RESTORE_MONGO" == 1 ]] && ! cmd mongorestore; then
                 [[ -x /usr/bin/mongorestore ]] && ln -sf /usr/bin/mongorestore /usr/local/bin/mongorestore
             fi
@@ -520,7 +519,7 @@ install_selected_packages() {
                 die "Automatic fresh MSSQL installation is not provided for Arch. Install a supported Microsoft SQL Server Linux package separately, then rerun the restore."
             fi
 
-            if ((${#pkgs[@]})); then
+            if [[ ${#pkgs[@]} -gt 0 ]]; then
                 log "Installing/upgrading selected Arch restore packages..."
                 pacman -S --noconfirm --needed "${pkgs[@]}"
             fi
@@ -553,16 +552,13 @@ verify_archive() {
 
     if [[ -f "$checksum_file" ]]; then
         log "Verifying detached SHA-256 checksum..."
-
         (
             cd "$(dirname "$ARCHIVE")"
             sha256sum --strict --check "$(basename "$checksum_file")"
         ) || die "Archive SHA-256 verification failed. Backup may be corrupted."
-
         log "Archive SHA-256: OK"
     else
         warn "Detached SHA-256 checksum file not found: $checksum_file"
-
         if ! prompt_yes_no "Continue without SHA-256 verification?" N; then
             die "Restore aborted because checksum file is missing."
         fi
@@ -571,11 +567,10 @@ verify_archive() {
 
 extract_archive() {
     mkdir -p "$RESTORE_ROOT"
-
     verify_archive
 
     log "Extracting backup archive..."
-    tar --acls --xattrs --numeric-owner         -xzf "$ARCHIVE"         -C "$RESTORE_ROOT" ||
+    tar --acls --xattrs --numeric-owner -xzf "$ARCHIVE" -C "$RESTORE_ROOT" ||
         die "Backup archive extraction failed."
 
     TREE="$RESTORE_ROOT/server-backup"
@@ -600,22 +595,23 @@ extract_archive() {
 # Helpers
 # -------------------------------------------------------------------
 
-backup_existing_dir() {
+safe_backup_dir() {
     local path="$1"
     local stamp="$2"
+    local backup_path="${path}.before-restore-${stamp}"
 
-    if [[ -e "$path" ]]; then
-        mv "$path" "${path}.before-restore-${stamp}"
-        printf '%s\n' "${path}.before-restore-${stamp}"
+    if [[ -e "$path" || -L "$path" ]]; then
+        if mountpoint -q "$path" 2>/dev/null; then
+            warn "$path is a mount point. Clearing contents instead of moving."
+            find "$path" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
+            echo ""
+        else
+            mv "$path" "$backup_path"
+            echo "$backup_path"
+        fi
+    else
+        echo ""
     fi
-}
-
-restore_tree_dir() {
-    local source="$1"
-    local destination="$2"
-
-    mkdir -p "$destination"
-    cp -a "$source/." "$destination/"
 }
 
 # -------------------------------------------------------------------
@@ -631,19 +627,17 @@ restore_www() {
 
     log "[1] Restoring /var/www"
 
+    local stamp="$(date +%Y%m%d_%H%M%S)"
     local old
-    old="/var/www.before-restore-$(date +%Y%m%d_%H%M%S)"
-
-    if [[ -d /var/www ]]; then
-        mv /var/www "$old"
-    fi
+    old="$(safe_backup_dir "/var/www" "$stamp")"
 
     mkdir -p /var/www
 
-    if ! tar --acls --xattrs --numeric-owner \
-        -xzf "$TREE/WWW/var-www.tar.gz" -C /var; then
+    if ! tar --acls --xattrs --numeric-owner -xzf "$TREE/WWW/var-www.tar.gz" -C /var; then
         rm -rf /var/www
-        [[ -d "$old" ]] && mv "$old" /var/www
+        if [[ -n "$old" && -d "$old" ]]; then
+            mv "$old" /var/www
+        fi
         die "/var/www restore failed. Original directory restored."
     fi
 
@@ -663,19 +657,14 @@ restore_letsencrypt() {
 
     log "[2] Restoring Let's Encrypt / SSL configuration"
 
+    local stamp="$(date +%Y%m%d_%H%M%S)"
     local old
-    old="/etc/letsencrypt.before-restore-$(date +%Y%m%d_%H%M%S)"
-
-    if [[ -d /etc/letsencrypt ]]; then
-        mv /etc/letsencrypt "$old"
-    fi
+    old="$(safe_backup_dir "/etc/letsencrypt" "$stamp")"
 
     mkdir -p /etc/letsencrypt
     cp -a "$TREE/SECURITY/etc-letsencrypt/." /etc/letsencrypt/
-
     chmod 700 /etc/letsencrypt 2>/dev/null || true
 
-    # Save old location for Nginx rollback.
     LETSENCRYPT_OLD="$old"
     log "Let's Encrypt configuration restored."
 }
@@ -689,14 +678,7 @@ normalize_nginx_http2_syntax() {
 
     local f tmp
     while IFS= read -r -d '' f; do
-        # Modern nginx deprecates: listen 443 ssl http2;
-        # Convert it to:
-        #   listen 443 ssl;
-        #   http2 on;
-        #
-        # Only transform a listen directive that explicitly contains
-        # the standalone http2 parameter. Do not touch comments.
-        if grep -Eq '^[[:space:]]*listen[[:space:]].*[[:space:]]http2[[:space:]]*;' "$f"; then
+        if grep -Eq '^[[:space:]]*listen[[:space:]].*\bhttp2\b.*;' "$f"; then
             tmp="${f}.restore-http2.tmp"
 
             awk '
@@ -704,9 +686,9 @@ normalize_nginx_http2_syntax() {
             /^[[:space:]]*http2[[:space:]]+on[[:space:]]*;/ { has_http2_on=1 }
             {
                 line=$0
-                if (line !~ /^[[:space:]]*#/
-                    && line ~ /^[[:space:]]*listen[[:space:]].*[[:space:]]http2[[:space:]]*;/) {
-                    sub(/[[:space:]]+http2[[:space:]]*;/, ";", line)
+                if (line !~ /^[[:space:]]*#/ && line ~ /^[[:space:]]*listen[[:space:]].*\bhttp2\b.*;/) {
+                    gsub(/[[:space:]]*\bhttp2\b[[:space:]]*/, " ", line)
+                    gsub(/[[:space:]]+;/, ";", line)
                     print line
                     if (!has_http2_on) {
                         print "    http2 on;"
@@ -738,14 +720,9 @@ restore_nginx() {
 
     systemctl stop nginx 2>/dev/null || true
 
-    local stamp
-    stamp="$(date +%Y%m%d_%H%M%S)"
-
-    local old_nginx="/etc/nginx.before-restore-${stamp}"
-
-    if [[ -d /etc/nginx ]]; then
-        mv /etc/nginx "$old_nginx"
-    fi
+    local stamp="$(date +%Y%m%d_%H%M%S)"
+    local old_nginx
+    old_nginx="$(safe_backup_dir "/etc/nginx" "$stamp")"
 
     mkdir -p /etc/nginx
     cp -a "$TREE/NGINX/etc-nginx/." /etc/nginx/
@@ -757,16 +734,12 @@ restore_nginx() {
 
     if nginx -t; then
         log "Nginx configuration test: OK"
-
         systemctl enable nginx >/dev/null 2>&1 || true
 
         if systemctl restart nginx; then
             log "Nginx restarted successfully."
-
-            # Old config is intentionally retained for manual rollback.
             return 0
         fi
-
         warn "Nginx restart failed; rolling back."
     else
         warn "Nginx configuration test failed; rolling back."
@@ -777,13 +750,12 @@ restore_nginx() {
     # ----------------------------------------------------------------
     rm -rf /etc/nginx
 
-    if [[ -d "$old_nginx" ]]; then
+    if [[ -n "$old_nginx" && -d "$old_nginx" ]]; then
         mv "$old_nginx" /etc/nginx
     else
         mkdir -p /etc/nginx
     fi
 
-    # Restore previous Let's Encrypt directory if this restore replaced it.
     if [[ -n "${LETSENCRYPT_OLD:-}" && -d "$LETSENCRYPT_OLD" ]]; then
         rm -rf /etc/letsencrypt
         mv "$LETSENCRYPT_OLD" /etc/letsencrypt
@@ -836,11 +808,9 @@ restore_crowdsec() {
 
     systemctl stop crowdsec 2>/dev/null || true
 
-    local old="/etc/crowdsec.before-restore-$(date +%Y%m%d_%H%M%S)"
-
-    if [[ -d /etc/crowdsec ]]; then
-        mv /etc/crowdsec "$old"
-    fi
+    local stamp="$(date +%Y%m%d_%H%M%S)"
+    local old
+    old="$(safe_backup_dir "/etc/crowdsec" "$stamp")"
 
     mkdir -p /etc/crowdsec
     cp -a "$TREE/CROWDSEC/etc-crowdsec/." /etc/crowdsec/
@@ -851,7 +821,7 @@ restore_crowdsec() {
        systemctl list-unit-files crowdsec.service >/dev/null 2>&1; then
         systemctl enable crowdsec 2>/dev/null || true
         systemctl start crowdsec || {
-            warn "CrowdSec failed to start. Previous config: $old"
+            warn "CrowdSec failed to start. Previous config: ${old:-none}"
         }
     fi
 }
@@ -876,6 +846,7 @@ restore_postgres_globals_prepare() {
 
     mkdir -p "$(dirname "$output")" ||
         die "PostgreSQL: could not create globals restore workspace."
+    
     local line decl role_name
     local -a existing_roles=()
     declare -A existing_role_map=()
@@ -897,8 +868,6 @@ restore_postgres_globals_prepare() {
             decl="${BASH_REMATCH[1]}"
             role_name="$decl"
 
-            # pg_dumpall normally emits CREATE ROLE <identifier>;
-            # support both quoted and unquoted identifiers here.
             if [[ "${role_name:0:1}" == '"' && "${role_name: -1}" == '"' ]]; then
                 role_name="${role_name:1:${#role_name}-2}"
                 role_name="$(printf '%s' "$role_name" | sed 's/""/"/g')"
@@ -974,13 +943,8 @@ restore_postgres() {
     chmod -R u+rwX "$TREE/POSTGRES" ||
         die "Could not set PostgreSQL backup permissions."
 
-    # RESTORE_ROOT/TREE are private by default (umask 077). Grant only
-    # traversal to allow the postgres OS account to reach its own files.
     chmod o+x "$RESTORE_ROOT" "$TREE" ||
         die "Could not grant PostgreSQL traverse permission to restore workspace."
-
-    log "PostgreSQL: backup ownership fixed (postgres:postgres)."
-    log "PostgreSQL: restore workspace traverse permission fixed."
 
     systemctl enable postgresql 2>/dev/null || true
     systemctl start postgresql || die "PostgreSQL service could not be started."
@@ -1035,7 +999,7 @@ restore_postgres() {
             unset PGPASSWORD
             die "PostgreSQL globals restore failed."
         fi
-        log "PostgreSQL: globals restored successfully. Existing roles were preserved without duplicate CREATE ROLE errors."
+        log "PostgreSQL: globals restored successfully. Existing roles were preserved."
     fi
 
     local -a dumps=()
@@ -1071,10 +1035,14 @@ restore_postgres() {
 
         if [[ "$db_exists" == "1" ]]; then
             log "PostgreSQL [$index/$total]: dropping existing database '$safe'..."
-            pg_exec -d postgres -c "DROP DATABASE \"$ident\" WITH (FORCE);" || {
-                unset PGPASSWORD
-                die "Could not drop existing PostgreSQL database: $safe"
-            }
+            if ! pg_exec -d postgres -c "DROP DATABASE \"$ident\" WITH (FORCE);" 2>/dev/null; then
+                log "PostgreSQL: FORCE drop failed, trying legacy connection termination..."
+                pg_exec -d postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$safe';" >/dev/null 2>&1 || true
+                pg_exec -d postgres -c "DROP DATABASE \"$ident\";" || {
+                    unset PGPASSWORD
+                    die "Could not drop existing PostgreSQL database: $safe"
+                }
+            fi
         fi
 
         log "PostgreSQL [$index/$total]: creating database '$safe'..."
@@ -1084,13 +1052,7 @@ restore_postgres() {
         }
 
         log "PostgreSQL [$index/$total]: loading $(basename "$dump")..."
-        if ! pg_restore_exec \
-            -v \
-            --exit-on-error \
-            --no-owner \
-            --no-acl \
-            --dbname="$safe" \
-            "$dump"; then
+        if ! pg_restore_exec -v --exit-on-error --no-owner --no-acl --dbname="$safe" "$dump"; then
             unset PGPASSWORD
             die "PostgreSQL restore failed for database: $safe"
         fi
@@ -1124,8 +1086,6 @@ restore_mongo() {
     log "[7] Restoring MongoDB"
     log "MongoDB: preparing backup ownership and permissions..."
 
-    # The restore process itself runs as root, but the backup file is kept
-    # private and assigned to the service account when it exists.
     if id mongodb >/dev/null 2>&1; then
         chown mongodb:mongodb "$TREE/MONGODB/mongodb.archive.gz" ||
             die "Could not assign MongoDB backup ownership."
@@ -1155,12 +1115,7 @@ restore_mongo() {
     uri="${MONGO_URI:-mongodb://127.0.0.1:27017}"
 
     log "MongoDB: restoring archive..."
-    if ! mongorestore \
-        --uri="$uri" \
-        --archive="$TREE/MONGODB/mongodb.archive.gz" \
-        --gzip \
-        --drop \
-        --stopOnError; then
+    if ! mongorestore --uri="$uri" --archive="$TREE/MONGODB/mongodb.archive.gz" --gzip --drop --stopOnError; then
         die "MongoDB restore failed."
     fi
 
@@ -1220,8 +1175,6 @@ setup_fresh_mssql_if_needed() {
 
     [[ -x /opt/mssql/bin/mssql-conf ]] || die "mssql-conf is not installed."
 
-    # Native package installs require an initial mssql-conf setup. Detect a
-    # configured instance by the presence of the EULA acceptance setting.
     if [[ -f "$server_conf" ]] && grep -qiE '^[[:space:]]*accepteula[[:space:]]*=[[:space:]]*[Yy]' "$server_conf"; then
         return 0
     fi
@@ -1275,7 +1228,6 @@ restore_mssql() {
 
     [[ -n "$password" ]] || die "MSSQL password is required for SQL restore."
 
-    # SQLCMDPASSWORD avoids putting the SA password in the process command line.
     export SQLCMDPASSWORD="$password"
 
     local -a SQLCMD
@@ -1287,8 +1239,6 @@ restore_mssql() {
         die "Cannot connect to MSSQL with the supplied credentials."
     fi
 
-    # SQL Server reads .bak files as the mssql service account. Stage them in
-    # its native backup directory with strict ownership and permissions.
     local mssql_backup_dir="/var/opt/mssql/backup"
     mkdir -p "$mssql_backup_dir"
     chown mssql:mssql "$mssql_backup_dir" || die "Could not assign MSSQL backup directory ownership."
@@ -1307,7 +1257,7 @@ restore_mssql() {
         return 0
     fi
 
-    local bak staged_bak db qdb qpath logical_data logical_log data_file log_file sql
+    local bak staged_bak db qdb qpath move_clauses data_file log_file sql
     local index=0
 
     for bak in "${baks[@]}"; do
@@ -1329,30 +1279,41 @@ restore_mssql() {
         log "MSSQL [$index/$total]: backup verification OK."
 
         log "MSSQL [$index/$total]: reading logical file names..."
-        logical_data="$(
-            "${SQLCMD[@]}" -h -1 -W -s '|' -Q \
-                "RESTORE FILELISTONLY FROM DISK=N'$qpath';" |
-                awk -F'|' '$3 == "D" || $3 == "ROWS" {print $1; exit}'
-        )"
-        logical_log="$(
-            "${SQLCMD[@]}" -h -1 -W -s '|' -Q \
-                "RESTORE FILELISTONLY FROM DISK=N'$qpath';" |
-                awk -F'|' '$3 == "L" {print $1; exit}'
-        )"
+        local file_list
+        file_list="$("${SQLCMD[@]}" -h -1 -W -s '|' -Q "RESTORE FILELISTONLY FROM DISK=N'$qpath';")"
+        
+        move_clauses=""
+        data_file=""
+        log_file=""
+        
+        while IFS='|' read -r logical_name physical_name type rest; do
+            logical_name="${logical_name#"${logical_name%%[![:space:]]*}"}"
+            logical_name="${logical_name%"${logical_name##*[![:space:]]}"}"
+            type="${type#"${type%%[![:space:]]*}"}"
+            type="${type%"${type##*[![:space:]]}"}"
+            
+            if [[ "$type" == "D" ]]; then
+                local safe_logical="$(echo "$logical_name" | tr -cd '[:alnum:]_-')"
+                [[ -z "$safe_logical" ]] && safe_logical="data"
+                data_file="/var/opt/mssql/data/${db}_${safe_logical}.mdf"
+                move_clauses+="MOVE N'$(mssql_escape_literal "$logical_name")' TO N'$(mssql_escape_literal "$data_file")', "
+            elif [[ "$type" == "L" ]]; then
+                local safe_logical="$(echo "$logical_name" | tr -cd '[:alnum:]_-')"
+                [[ -z "$safe_logical" ]] && safe_logical="log"
+                log_file="/var/opt/mssql/data/${db}_${safe_logical}_log.ldf"
+                move_clauses+="MOVE N'$(mssql_escape_literal "$logical_name")' TO N'$(mssql_escape_literal "$log_file")', "
+            fi
+        done <<< "$file_list"
+        
+        move_clauses="${move_clauses%, }"
 
-        logical_data="$(printf '%s' "$logical_data" | sed 's/[[:space:]]*$//')"
-        logical_log="$(printf '%s' "$logical_log" | sed 's/[[:space:]]*$//')"
-
-        if [[ -z "$logical_data" || -z "$logical_log" ]]; then
+        if [[ -z "$data_file" || -z "$log_file" ]]; then
             die "Could not determine logical data/log files for MSSQL database: $db"
         fi
 
         mkdir -p /var/opt/mssql/data
         chown mssql:mssql /var/opt/mssql/data
         chmod 750 /var/opt/mssql/data
-
-        data_file="/var/opt/mssql/data/${db}.mdf"
-        log_file="/var/opt/mssql/data/${db}_log.ldf"
 
         sql="
 IF DB_ID(N'$(mssql_escape_literal "$db")') IS NOT NULL
@@ -1365,10 +1326,7 @@ FROM DISK=N'$qpath'
 WITH
     REPLACE,
     RECOVERY,
-    MOVE N'$(mssql_escape_literal "$logical_data")'
-        TO N'$(mssql_escape_literal "$data_file")',
-    MOVE N'$(mssql_escape_literal "$logical_log")'
-        TO N'$(mssql_escape_literal "$log_file")',
+    $move_clauses,
     STATS=5;
 
 ALTER DATABASE [$qdb] SET MULTI_USER;
@@ -1406,8 +1364,7 @@ restore_docker() {
     systemctl enable docker 2>/dev/null || true
     systemctl start docker || die "Docker service could not be started."
 
-    local archive
-    local vol
+    local archive vol vol_path
 
     while IFS= read -r -d '' archive; do
         vol="$(basename "$archive" .tar.gz)"
@@ -1417,17 +1374,17 @@ restore_docker() {
         docker volume inspect "$vol" >/dev/null 2>&1 ||
             docker volume create "$vol" >/dev/null
 
-        # Use the host tar instead of requiring the alpine image.
-        # The volume is mounted into a temporary container.
-        if ! docker run --rm \
-            -v "$vol:/data" \
-            -v "$(dirname "$archive"):/backup:ro" \
-            alpine:latest \
-            sh -c '
-                set -eu
-                find /data -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-                tar xzf "/backup/'"$(basename "$archive")"'" -C /data
-            '; then
+        vol_path="$(docker volume inspect --format '{{ .Mountpoint }}' "$vol")"
+
+        if [[ -z "$vol_path" || "$vol_path" == "/" ]]; then
+            warn "Could not determine mount point for Docker volume $vol. Skipping."
+            continue
+        fi
+
+        log "Extracting to $vol_path"
+        find "$vol_path" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
+
+        if ! tar --acls --xattrs --numeric-owner -xzf "$archive" -C "$vol_path"; then
             die "Docker volume restore failed: $vol"
         fi
     done < <(find "$TREE/DOCKER/volumes" -type f -name '*.tar.gz' -print0)
@@ -1444,34 +1401,20 @@ restore_firewall() {
 
     log "[10] Restoring firewall rules"
 
-    if command -v ufw >/dev/null 2>&1 &&
-       [[ -d "$TREE/FIREWALL/etc-ufw" ]]; then
-
-        # Back up current UFW config before replacing it.
-        if [[ -d /etc/ufw ]]; then
-            mv /etc/ufw "/etc/ufw.before-restore-$(date +%Y%m%d_%H%M%S)"
-        fi
+    if command -v ufw >/dev/null 2>&1 && [[ -d "$TREE/FIREWALL/etc-ufw" ]]; then
+        local stamp="$(date +%Y%m%d_%H%M%S)"
+        safe_backup_dir "/etc/ufw" "$stamp" >/dev/null
 
         mkdir -p /etc/ufw
         cp -a "$TREE/FIREWALL/etc-ufw/." /etc/ufw/
-
         ufw --force enable || die "UFW restore/enable failed."
 
-    elif command -v nft >/dev/null 2>&1 &&
-         [[ -f "$TREE/FIREWALL/nftables-ruleset.txt" ]]; then
+    elif command -v nft >/dev/null 2>&1 && [[ -f "$TREE/FIREWALL/nftables-ruleset.txt" ]]; then
+        nft -c -f "$TREE/FIREWALL/nftables-ruleset.txt" || die "nftables syntax validation failed."
+        nft -f "$TREE/FIREWALL/nftables-ruleset.txt" || die "nftables restore failed."
 
-        # The backup is textual output from `nft list ruleset`.
-        nft -c -f "$TREE/FIREWALL/nftables-ruleset.txt" ||
-            die "nftables syntax validation failed."
-
-        nft -f "$TREE/FIREWALL/nftables-ruleset.txt" ||
-            die "nftables restore failed."
-
-    elif command -v iptables-restore >/dev/null 2>&1 &&
-         [[ -f "$TREE/FIREWALL/iptables.rules" ]]; then
-
-        iptables-restore < "$TREE/FIREWALL/iptables.rules" ||
-            die "iptables restore failed."
+    elif command -v iptables-restore >/dev/null 2>&1 && [[ -f "$TREE/FIREWALL/iptables.rules" ]]; then
+        iptables-restore < "$TREE/FIREWALL/iptables.rules" || die "iptables restore failed."
     else
         warn "No supported firewall backup/restore method found."
     fi
@@ -1490,14 +1433,15 @@ restore_ssh() {
 
     log "[11] Restoring SSH configuration"
 
-    local old="/etc/ssh.before-restore-$(date +%Y%m%d_%H%M%S)"
+    local stamp="$(date +%Y%m%d_%H%M%S)"
+    local old
+    old="$(safe_backup_dir "/etc/ssh" "$stamp")"
 
-    cp -a /etc/ssh "$old"
+    mkdir -p /etc/ssh
     cp -a "$TREE/SSH/etc-ssh/." /etc/ssh/
 
     if sshd -t; then
-        if systemctl reload ssh 2>/dev/null ||
-           systemctl reload sshd 2>/dev/null; then
+        if systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null; then
             log "SSH configuration restored successfully."
         else
             warn "SSH configuration is valid but reload failed."
@@ -1506,12 +1450,12 @@ restore_ssh() {
         log "ERROR: SSH configuration is invalid. Rolling back."
 
         rm -rf /etc/ssh
-        cp -a "$old" /etc/ssh
+        if [[ -n "$old" && -d "$old" ]]; then
+            cp -a "$old" /etc/ssh
+        fi
 
         sshd -t || true
-        systemctl reload ssh 2>/dev/null ||
-            systemctl reload sshd 2>/dev/null ||
-            true
+        systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
 
         die "SSH configuration restore failed and was rolled back."
     fi
@@ -1594,8 +1538,6 @@ main() {
     install_selected_packages
     extract_archive
 
-    # Dependency-aware order:
-    # WWW -> SSL -> Nginx -> systemd -> security -> databases -> Docker
     restore_www
     restore_letsencrypt
     restore_nginx
