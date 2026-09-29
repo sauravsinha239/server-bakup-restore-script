@@ -14,7 +14,7 @@ umask 077
 # - Firewall and SSH restoration are OFF by default in the checkbox menu.
 # - Temporary extracted files are retained by default.
 
-SCRIPT_VERSION="2.5.0"
+SCRIPT_VERSION="2.6.0"
 ARCHIVE="${1:-}"
 
 # Normalize the archive path once so every later operation is independent
@@ -37,6 +37,19 @@ TREE=""
 ERRORS=0
 WARNINGS=0
 
+# Persistent production debug log. Set DEBUG=1 for shell tracing.
+DEBUG="${DEBUG:-0}"
+LOG_FILE="${LOG_FILE:-/var/log/server-restore.log}"
+TRACE_FILE=""
+
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/var/tmp/server-restore.log"
+chmod 600 "$LOG_FILE" 2>/dev/null || true
+
+if [[ "$DEBUG" == "1" ]]; then
+    TRACE_FILE="$RESTORE_ROOT.debug.trace"
+fi
+
 # Package policy: selected restore packages are upgraded/installed.
 # No full Debian/Ubuntu upgrade is performed automatically.
 UPGRADE_SELECTED_PACKAGES=1
@@ -46,7 +59,9 @@ UPGRADE_SELECTED_PACKAGES=1
 # -------------------------------------------------------------------
 
 log() {
-    printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+    local msg
+    msg="[$(date '+%F %T')] $*"
+    printf '%s\n' "$msg" | tee -a "$LOG_FILE"
 }
 
 warn() {
@@ -59,6 +74,18 @@ die() {
     exit 1
 }
 
+on_error() {
+    local rc=$?
+    local line="${BASH_LINENO[0]:-unknown}"
+    local cmd="${BASH_COMMAND:-unknown}"
+    log "ERROR: command failed rc=$rc line=$line: $cmd"
+    log "ERROR: restore workspace: ${RESTORE_ROOT:-unknown}"
+    log "ERROR: debug log: $LOG_FILE"
+    exit "$rc"
+}
+
+trap on_error ERR
+
 cmd() {
     command -v "$1" >/dev/null 2>&1
 }
@@ -66,6 +93,34 @@ cmd() {
 # -------------------------------------------------------------------
 # Interactive checkbox menu
 # -------------------------------------------------------------------
+
+prompt_yes_no() {
+    local question="$1"
+    local default="${2:-N}"
+    local answer
+
+    # Non-interactive restore: preserve safe default.
+    if [[ ! -t 0 ]]; then
+        [[ "$default" =~ ^[Yy]$ ]]
+        return
+    fi
+
+    while true; do
+        if [[ "$default" =~ ^[Yy]$ ]]; then
+            read -r -p "$question [Y/n]: " answer
+            answer="${answer:-Y}"
+        else
+            read -r -p "$question [y/N]: " answer
+            answer="${answer:-N}"
+        fi
+
+        case "$answer" in
+            [Yy]|[Yy][Ee][Ss]) return 0 ;;
+            [Nn]|[Nn][Oo]) return 1 ;;
+            *) echo "Please answer yes or no." ;;
+        esac
+    done
+}
 
 prompt_with_default() {
     local var_name="$1"
@@ -528,6 +583,13 @@ extract_archive() {
     [[ -d "$TREE" ]] ||
         die "Invalid archive: missing server-backup directory."
 
+    log "Archive root detected: $TREE"
+    if [[ -f "$TREE/MANIFEST.sha256" ]]; then
+        log "Backup manifest found: $TREE/MANIFEST.sha256"
+    else
+        warn "Backup MANIFEST.sha256 not found inside archive."
+    fi
+
     [[ -f "$TREE/backup-info.txt" ]] ||
         warn "backup-info.txt not found; archive may be from an older backup version."
 
@@ -622,6 +684,49 @@ restore_letsencrypt() {
 # Nginx with actual rollback
 # -------------------------------------------------------------------
 
+normalize_nginx_http2_syntax() {
+    [[ -d /etc/nginx ]] || return 0
+
+    local f tmp
+    while IFS= read -r -d '' f; do
+        # Modern nginx deprecates: listen 443 ssl http2;
+        # Convert it to:
+        #   listen 443 ssl;
+        #   http2 on;
+        #
+        # Only transform a listen directive that explicitly contains
+        # the standalone http2 parameter. Do not touch comments.
+        if grep -Eq '^[[:space:]]*listen[[:space:]].*[[:space:]]http2[[:space:]]*;' "$f"; then
+            tmp="${f}.restore-http2.tmp"
+
+            awk '
+            BEGIN { has_http2_on=0 }
+            /^[[:space:]]*http2[[:space:]]+on[[:space:]]*;/ { has_http2_on=1 }
+            {
+                line=$0
+                if (line !~ /^[[:space:]]*#/
+                    && line ~ /^[[:space:]]*listen[[:space:]].*[[:space:]]http2[[:space:]]*;/) {
+                    sub(/[[:space:]]+http2[[:space:]]*;/, ";", line)
+                    print line
+                    if (!has_http2_on) {
+                        print "    http2 on;"
+                        has_http2_on=1
+                    }
+                } else {
+                    print line
+                }
+            }' "$f" > "$tmp" || {
+                rm -f "$tmp"
+                die "Nginx: failed to normalize HTTP/2 syntax in $f"
+            }
+
+            cat "$tmp" > "$f"
+            rm -f "$tmp"
+            log "Nginx: migrated deprecated listen ... http2 syntax in $f"
+        fi
+    done < <(find /etc/nginx -type f \( -name '*.conf' -o -path '*/sites-enabled/*' -o -path '*/sites-available/*' \) -print0 2>/dev/null)
+}
+
 restore_nginx() {
     [[ "$RESTORE_NGINX" == 1 ]] || return 0
     [[ -d "$TREE/NGINX/etc-nginx" ]] || {
@@ -644,6 +749,9 @@ restore_nginx() {
 
     mkdir -p /etc/nginx
     cp -a "$TREE/NGINX/etc-nginx/." /etc/nginx/
+
+    log "Normalizing deprecated Nginx HTTP/2 listen syntax..."
+    normalize_nginx_http2_syntax
 
     log "Testing restored Nginx configuration..."
 
@@ -764,7 +872,10 @@ sql_literal_escape() {
 
 restore_postgres_globals_prepare() {
     local input="$1"
-    local output="$RESTORE_ROOT/POSTGRES/globals.restore.sql"
+    local output="$TREE/POSTGRES/globals.restore.sql"
+
+    mkdir -p "$(dirname "$output")" ||
+        die "PostgreSQL: could not create globals restore workspace."
     local line decl role_name
     local -a existing_roles=()
     declare -A existing_role_map=()
@@ -776,7 +887,8 @@ restore_postgres_globals_prepare() {
         runuser -u postgres -- psql -Atqc "SELECT rolname FROM pg_roles;"
     )
 
-    : > "$output"
+    [[ -f "$input" ]] || die "PostgreSQL: globals input file not found: $input"
+    : > "$output" || die "PostgreSQL: could not create prepared globals file: $output"
 
     local create_role_re='^CREATE[[:space:]]+ROLE[[:space:]]+(.+);[[:space:]]*$'
 
@@ -802,8 +914,15 @@ restore_postgres_globals_prepare() {
         fi
     done < "$input" > "$output"
 
-    chown postgres:postgres "$output"
-    chmod 600 "$output"
+    chown postgres:postgres "$output" ||
+        die "PostgreSQL: could not set ownership on prepared globals file."
+    chmod 600 "$output" ||
+        die "PostgreSQL: could not set permissions on prepared globals file."
+
+    [[ -s "$output" ]] ||
+        die "PostgreSQL: prepared globals file is empty: $output"
+
+    log "PostgreSQL: prepared globals file: $output"
     printf '%s\n' "$output"
 }
 
@@ -1414,6 +1533,13 @@ final_status() {
     echo "Restore workspace:"
     echo "  $RESTORE_ROOT"
     echo
+    echo "Debug log:"
+    echo "  $LOG_FILE"
+    if [[ -n "${TRACE_FILE:-}" ]]; then
+        echo "Shell trace:"
+        echo "  $TRACE_FILE"
+    fi
+    echo
     echo "Package policy:"
     if [[ "$UPGRADE_SELECTED_PACKAGES" == 1 ]]; then
         echo "  Selected restore packages were upgraded/installed."
@@ -1449,7 +1575,20 @@ final_status() {
 # -------------------------------------------------------------------
 
 main() {
+    mkdir -p "$RESTORE_ROOT"
     log "Starting server disaster-recovery restore v$SCRIPT_VERSION"
+    log "Archive: $ARCHIVE"
+    log "Restore workspace: $RESTORE_ROOT"
+    log "Persistent debug log: $LOG_FILE"
+
+    if [[ "$DEBUG" == "1" ]]; then
+        TRACE_FILE="$RESTORE_ROOT/debug.trace"
+        exec 19>"$TRACE_FILE"
+        export BASH_XTRACEFD=19
+        PS4='+ ${BASH_SOURCE}:${LINENO}:${FUNCNAME[0]}: '
+        set -x
+        log "DEBUG shell tracing enabled: $TRACE_FILE"
+    fi
 
     choose_components
     install_selected_packages
@@ -1469,6 +1608,7 @@ main() {
     restore_firewall
     restore_ssh
 
+    log "All selected restore stages completed."
     final_status
 }
 
