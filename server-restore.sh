@@ -1449,9 +1449,17 @@ restore_postgres() {
     log "[6/11] Restoring PostgreSQL"
 
     need_cmd psql
-    need_cmd pg_restore
+
     id postgres >/dev/null 2>&1 ||
-        die "PostgreSQL OS user does not exist."
+    die "PostgreSQL OS user does not exist."
+
+    local PG_RESTORE_BIN
+
+    PG_RESTORE_BIN="$(get_pg_restore_bin)" ||
+    die "No usable pg_restore executable found."
+
+    log "PostgreSQL restore tool: $("$PG_RESTORE_BIN" --version)"
+        
 
     start_postgres
 
@@ -1537,6 +1545,43 @@ restore_postgres() {
     done
 
     log "PostgreSQL restore completed."
+}
+ # get pg restore version
+
+get_pg_restore_bin() {
+    local candidate
+    local best=""
+    local best_major=0
+    local major
+
+    # Prefer the newest installed pg_restore.
+    while IFS= read -r candidate; do
+        [[ -x "$candidate" ]] || continue
+
+        major="$(
+            "$candidate" --version 2>/dev/null |
+                sed -n 's/.*PostgreSQL) \([0-9][0-9]*\).*/\1/p'
+        )"
+
+        [[ "$major" =~ ^[0-9]+$ ]] || continue
+
+        if (( major > best_major )); then
+            best_major="$major"
+            best="$candidate"
+        fi
+    done < <(
+        find /usr/lib/postgresql -type f -path '*/bin/pg_restore' \
+            2>/dev/null | sort -V
+    )
+
+    # Fallback to PATH version.
+    if [[ -z "$best" ]] && command -v pg_restore >/dev/null 2>&1; then
+        best="$(command -v pg_restore)"
+    fi
+
+    [[ -n "$best" ]] || return 1
+
+    printf '%s\n' "$best"
 }
 
 # ---------------------------------------------------------------------------
