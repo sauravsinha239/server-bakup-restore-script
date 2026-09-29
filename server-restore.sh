@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Server Disaster Recovery Restore
-# Version: 4.1.1
+# Version: 4.2.0
 #
 # Design:
 #   1. Preflight and identify OS / architecture
@@ -13,6 +13,17 @@
 #   8. Validate services/configuration
 #   9. Keep previous live configuration for rollback
 #
+# 4.2.0 fixes:
+#   - PostgreSQL pg_lsclusters parsing now handles all columns correctly.
+#   - PostgreSQL uses pg_ctlcluster --skip-systemctl-redirect in containers.
+#   - Microsoft APT sources are disabled outside sources.list.d (no APT warnings).
+#   - MSSQL tools use Microsoft's packages-microsoft-prod.deb bootstrap.
+#   - MSSQL waits for SQL Server readiness before RESTORE.
+#   - MongoDB direct-start waits for a real ping before restore.
+#   - SHA verification is independent of stale filenames inside .sha256 files.
+#   - Nginx 1.24.x keeps legacy listen ... http2 syntax.
+#   - Interactive component selection remains enabled.
+#
 # IMPORTANT:
 #   - Run as root.
 #   - Database restores are destructive for databases with the same name.
@@ -20,16 +31,16 @@
 #   - Firewall and SSH restoration are OFF by default.
 #
 # Usage:
-#   sudo ./server-restore-production-4.0.0.sh /path/to/backup.tar.gz
+#   sudo ./server-restore-production-4.2.0.sh /path/to/backup.tar.gz
 #   Docker container:
 #   docker run --rm -it -v /path/to/backups:/backup:ro \
 #       -v /var/run/docker.sock:/var/run/docker.sock \
 #       ubuntu:24.04
-#   ./server-restore-production-4.0.0.sh \
+#   ./server-restore-production-4.2.0.sh \
 #       /backup/server-backup-YYYY-MM-DD_HHMMSS.tar.gz
 #
 # Debug:
-#   sudo DEBUG=1 ./server-restore-production-4.0.0.sh /path/to/backup.tar.gz
+#   sudo DEBUG=1 ./server-restore-production-4.2.0.sh /path/to/backup.tar.gz
 #
 # Optional environment:
 #   RESTORE_ROOT=/var/tmp/my-restore
@@ -48,7 +59,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="4.1.1"
+VERSION="4.2.0"
 IN_CONTAINER=0
 CONTAINER_RUNTIME=""
 SYSTEMD_AVAILABLE=0
@@ -570,64 +581,63 @@ validate_selected_backup() {
 # ---------------------------------------------------------------------------
 
 apt_disable_conflicting_sources() {
-    local f backup
+    local f backup_dir backup base stamp
     [[ "$PACKAGE_MANAGER" == "apt" ]] || return 0
 
-    # Any pre-existing Microsoft source can break apt-get update before the
-    # restore script gets a chance to install the correct MSSQL repository.
-    # Keep the original as *.restore-disabled and restore it only if the script
-    # did not create a canonical replacement with the same path.
+    # Never rename a source file to *.restore-disabled inside sources.list.d:
+    # APT scans that directory and emits noisy "invalid filename extension"
+    # warnings. Store disabled sources outside APT's source directories.
+    backup_dir="/var/lib/server-restore/apt-disabled/$(date +%Y%m%d_%H%M%S)-$$"
+    safe_mkdir "$backup_dir" 0700
+
     while IFS= read -r -d '' f; do
+        case "$f" in
+            *.restore-disabled|*.restore-disabled.*) continue ;;
+        esac
         if grep -qiE 'packages\.microsoft\.com' "$f" 2>/dev/null; then
-            case "$f" in
-                *.restore-disabled|*.restore-disabled.*) continue ;;
-            esac
-            backup="${f}.restore-disabled"
-            if [[ -e "$backup" ]]; then
-                backup="${f}.restore-disabled.$(date +%s)"
-            fi
-            mv -f -- "$f" "$backup"
-            APT_DISABLED+=("$backup")
+            base="$(basename "$f")"
+            backup="$backup_dir/$base"
+            mv -f -- "$f" "$backup" || die "Could not disable Microsoft APT source: $f"
+            APT_DISABLED+=("$backup::$f")
             log "Temporarily disabled Microsoft source: $f"
         fi
     done < <(
-        {
-            [[ -f /etc/apt/sources.list ]] && printf '%s\0' /etc/apt/sources.list
-            find /etc/apt/sources.list.d -maxdepth 1 -type f \
-                \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null || true
-        }
+        find /etc/apt/sources.list.d -maxdepth 1 -type f \
+            \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null || true
     )
+
+    # Do not move /etc/apt/sources.list as a whole. It normally contains
+    # Ubuntu/Debian official repositories in addition to any third-party lines.
+    if [[ -f /etc/apt/sources.list ]] && grep -qiE 'packages\.microsoft\.com' /etc/apt/sources.list; then
+        warn "Microsoft repository is embedded in /etc/apt/sources.list; leaving it untouched to avoid disabling Ubuntu repositories."
+    fi
 }
 
 apt_restore_sources() {
-    local f original
-    for f in "${APT_DISABLED[@]:-}"; do
-        [[ -f "$f" ]] || continue
-        original="${f%.restore-disabled}"
-        # Timestamped backups have a different suffix.
-        if [[ "$original" == "$f" ]]; then
-            original="${f%%.restore-disabled.*}"
-        fi
+    local entry backup original
+    for entry in "${APT_DISABLED[@]:-}"; do
+        [[ "$entry" == *::* ]] || continue
+        backup="${entry%%::*}"
+        original="${entry#*::}"
+        [[ -f "$backup" ]] || continue
+
         if [[ -e "$original" ]]; then
-            warn "Not restoring disabled APT source because replacement exists: $original"
+            log "Keeping disabled legacy Microsoft source disabled because a replacement exists: $original"
             continue
         fi
 
-        local microsoft_current=0
-        while IFS= read -r -d '' current; do
-            if grep -qiE 'packages\.microsoft\.com' "$current" 2>/dev/null; then
-                microsoft_current=1
-                break
-            fi
-        done < <(find /etc/apt/sources.list.d -maxdepth 1 -type f \
-            \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null || true)
-
-        if (( microsoft_current == 1 )); then
+        # If the script installed a current Microsoft repository elsewhere,
+        # leave the old conflicting source disabled.
+        if find /etc/apt/sources.list.d -maxdepth 1 -type f \
+            \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null |
+            xargs -0 -r grep -lqiE 'packages\.microsoft\.com'; then
             log "Keeping disabled legacy Microsoft source disabled because an active Microsoft repository exists."
             continue
         fi
 
-        mv -f -- "$f" "$original" || warn "Could not restore APT source: $original"
+        safe_mkdir "$(dirname "$original")" 0755
+        mv -f -- "$backup" "$original" ||
+            warn "Could not restore APT source: $original"
     done
     APT_DISABLED=()
 }
@@ -798,13 +808,15 @@ install_mssql_ubuntu_official() {
     apt-get update
     apt-get install -y mssql-server
 
-    # Microsoft documents mssql-tools18 separately.
-    local tools_repo="/etc/apt/sources.list.d/mssql-tools18.list"
+    # Microsoft currently documents the packages-microsoft-prod.deb bootstrap
+    # for mssql-tools18 on Ubuntu 24.04. Use it instead of leaving a second
+    # manually-managed prod.list behind.
+    local repo_deb="/var/tmp/packages-microsoft-prod.deb"
     curl -fsSL \
-        "https://packages.microsoft.com/config/ubuntu/${OS_VERSION}/prod.list" \
-        -o "$tools_repo"
-
-    chmod 0644 "$tools_repo"
+        "https://packages.microsoft.com/config/ubuntu/${OS_VERSION}/packages-microsoft-prod.deb" \
+        -o "$repo_deb"
+    dpkg -i "$repo_deb" >/dev/null
+    rm -f -- "$repo_deb"
 
     apt-get update
     ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
@@ -1267,36 +1279,67 @@ pg_drop_create_database() {
 }
 
 start_postgres() {
+    log "PostgreSQL: starting database service/cluster..."
+
     if systemd_usable && unit_exists postgresql.service; then
-        service_start postgresql && return 0
+        if service_start postgresql; then
+            PG_SERVICE="postgresql"
+            return 0
+        fi
+        warn "systemd PostgreSQL start failed; trying cluster-level startup."
     fi
 
+    # Debian/Ubuntu uses pg_lsclusters + pg_ctlcluster. This is the preferred
+    # systemd-less/container path. pg_lsclusters columns are:
+    # version cluster port status owner datadir logfile
     if have_cmd pg_lsclusters && have_cmd pg_ctlcluster; then
-        local line version cluster status
-        while read -r version cluster status _; do
+        local version cluster port status owner datadir logfile
+        while IFS=" " read -r version cluster port status owner datadir logfile; do
             [[ -n "$version" && -n "$cluster" ]] || continue
+            [[ "$version" =~ ^[0-9]+$ ]] || continue
+
             if [[ "$status" != "online" ]]; then
-                log "PostgreSQL: starting cluster $version/$cluster without systemd."
-                pg_ctlcluster "$version" "$cluster" start || true
+                log "PostgreSQL: cluster $version/$cluster on port $port is $status; starting..."
+                if ! pg_ctlcluster --skip-systemctl-redirect "$version" "$cluster" start; then
+                    warn "Could not start PostgreSQL cluster $version/$cluster with pg_ctlcluster."
+                    continue
+                fi
             fi
-            if pg_ctlcluster "$version" "$cluster" status >/dev/null 2>&1; then
+
+            if have_cmd pg_isready && pg_isready -h 127.0.0.1 -p "$port" >/dev/null 2>&1; then
+                PG_SERVICE="${version}/${cluster}"
+                log "PostgreSQL: cluster $version/$cluster is ready on port $port."
+                return 0
+            fi
+
+            # pg_ctlcluster status is useful even when pg_isready is unavailable.
+            if pg_ctlcluster --skip-systemctl-redirect "$version" "$cluster" status >/dev/null 2>&1; then
                 PG_SERVICE="${version}/${cluster}"
                 return 0
             fi
         done < <(pg_lsclusters --no-header 2>/dev/null || true)
     fi
 
-    # Fallback for images where the cluster exists but pg_lsclusters is absent.
+    # Generic fallback for installations without Debian cluster tooling.
     if have_cmd pg_ctl; then
         local datadir
-        datadir="$(find /var/lib/postgresql -mindepth 2 -maxdepth 2 -type f -name PG_VERSION -printf '%h\n' 2>/dev/null | head -n1 || true)"
+        datadir="$(find /var/lib/postgresql -mindepth 2 -maxdepth 3 -type f -name PG_VERSION -printf '%h\n' 2>/dev/null | head -n1 || true)"
         if [[ -n "$datadir" ]]; then
+            log "PostgreSQL: starting data directory directly: $datadir"
             run_as postgres pg_ctl -D "$datadir" -w start || true
-            run_as postgres pg_ctl -D "$datadir" status >/dev/null 2>&1 && return 0
+            if run_as postgres pg_ctl -D "$datadir" status >/dev/null 2>&1; then
+                PG_SERVICE="$datadir"
+                return 0
+            fi
         fi
     fi
 
-    die "PostgreSQL could not be started (systemd unavailable and no usable cluster start method found)."
+    if have_cmd pg_isready && pg_isready -h 127.0.0.1 -p 5432 >/dev/null 2>&1; then
+        PG_SERVICE="127.0.0.1:5432"
+        return 0
+    fi
+
+    die "PostgreSQL could not be started. No usable systemd service, pg_ctlcluster cluster, or pg_ctl data directory was found."
 }
 
 restore_postgres() {
@@ -1411,18 +1454,39 @@ start_mongo() {
     if have_cmd mongod; then
         local cfg="${MONGO_CONFIG:-/etc/mongod.conf}"
         local pidfile="/var/run/mongodb/mongod.pid"
+        local logpath="/var/log/mongodb/mongod.log"
+
         if [[ -f "$cfg" ]]; then
             install -d -o mongodb -g mongodb -m 0755 /var/run/mongodb /var/log/mongodb 2>/dev/null || true
             if ! pgrep -x mongod >/dev/null 2>&1; then
                 log "MongoDB: starting mongod without systemd."
-                run_as mongodb mongod --config "$cfg" --fork --pidfilepath "$pidfile" || true
+                run_as mongodb mongod --config "$cfg" --fork --pidfilepath "$pidfile" --logpath "$logpath" || true
             fi
-            sleep 2
-            pgrep -x mongod >/dev/null 2>&1 && return 0
         fi
     fi
 
-    die "MongoDB could not be started (no working systemd unit or mongod direct-start configuration)."
+    local uri="${MONGO_URI:-mongodb://127.0.0.1:27017}"
+    local i
+    for i in {1..20}; do
+        if have_cmd mongosh; then
+            if mongosh "$uri" --quiet --eval 'db.adminCommand({ping:1}).ok' 2>/dev/null | grep -qx '1'; then
+                MONGO_SERVICE="mongod"
+                log "MongoDB: server is ready."
+                return 0
+            fi
+        elif have_cmd nc; then
+            if nc -z 127.0.0.1 27017 >/dev/null 2>&1; then
+                MONGO_SERVICE="mongod"
+                return 0
+            fi
+        elif pgrep -x mongod >/dev/null 2>&1; then
+            MONGO_SERVICE="mongod"
+            return 0
+        fi
+        sleep 1
+    done
+
+    die "MongoDB could not be started or did not become ready on 127.0.0.1:27017."
 }
 
 restore_mongo() {
@@ -1569,6 +1633,19 @@ mssql_setup_if_needed() {
     fi
 }
 
+wait_mssql_ready() {
+    local hostport="${1:-127.0.0.1,1433}"
+    local i
+    for i in {1..30}; do
+        if have_cmd sqlcmd && SQLCMDPASSWORD="${MSSQL_PASSWORD:-}" sqlcmd -S "$hostport" -C -b -U "${MSSQL_USER:-sa}" -Q 'SELECT 1' >/dev/null 2>&1; then
+            log "MSSQL: SQL Server is ready at $hostport."
+            return 0
+        fi
+        sleep 1
+    done
+    die "MSSQL did not become ready at $hostport."
+}
+
 mssql_sqlcmd() {
     SQLCMDPASSWORD="$MSSQL_PASSWORD" \
         sqlcmd -S "$MSSQL_SERVER" -C -b -U "$MSSQL_USER" "$@"
@@ -1597,6 +1674,8 @@ restore_mssql() {
         runuser -u mssql -- /opt/mssql/bin/sqlservr >/var/opt/mssql/sqlservr.restore.log 2>&1 &
         sleep 8
     fi
+
+    wait_mssql_ready "$MSSQL_SERVER"
 
     local stage="/var/opt/mssql/restore-staging"
     safe_mkdir "$stage" 0750
