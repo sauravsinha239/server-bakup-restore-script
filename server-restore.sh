@@ -1225,10 +1225,25 @@ pg_prepare_globals() {
 
     : > "$output"
 
-    local line decl role_name
+    local line decl role_name protected_line
     local create_role_re='^CREATE[[:space:]]+ROLE[[:space:]]+(.+);[[:space:]]*$'
+    local postgres_nologin_re='^[[:space:]]*ALTER[[:space:]]+ROLE[[:space:]]+("postgres"|postgres)([[:space:]]+.*)?NOLOGIN([^;]*);[[:space:]]*$'
 
     while IFS= read -r line || [[ -n "$line" ]]; do
+        # NEVER allow the backup globals to disable the native recovery role.
+        # pg_dumpall can contain statements such as:
+        #   ALTER ROLE postgres NOLOGIN;
+        #   ALTER ROLE postgres WITH NOSUPERUSER NOLOGIN;
+        # Those statements would lock out local peer authentication before
+        # the post-restore recovery check can run. Rewrite only NOLOGIN for
+        # the native postgres role; do not change any other role.
+        if [[ "$line" =~ $postgres_nologin_re ]]; then
+            protected_line="$(printf '%s\n' "$line" | sed -E 's/[[:space:]]NOLOGIN([[:space:]]*;)/ LOGIN\1/I')"
+            log "PostgreSQL: protecting native recovery role from NOLOGIN: $line"
+            printf '%s\n' "$protected_line" >> "$output"
+            continue
+        fi
+
         if [[ "$line" =~ $create_role_re ]]; then
             decl="${BASH_REMATCH[1]}"
             # globals.sql normally contains `CREATE ROLE <name> ...`.
@@ -1698,8 +1713,9 @@ mssql_sqlcmd() {
 }
 
 mssql_enable_recovery_login() {
-    # The built-in sa account is the native recovery account. A database .bak
-    # does not restore server-level login state, so verify/repair it explicitly.
+    # The built-in sa account is the native SQL Server recovery account.
+    # A .bak restores database state, not server-level login state.
+    # Therefore [sa] is repaired and verified independently.
     log "MSSQL: verifying native recovery login [sa]..."
 
     mssql_sqlcmd -Q "
@@ -1708,8 +1724,14 @@ IF NOT EXISTS (
 )
     THROW 50001, 'Built-in recovery login [sa] does not exist.', 1;
 
-ALTER LOGIN [sa] ENABLE;
-ALTER SERVER ROLE [sysadmin] ADD MEMBER [sa];
+IF EXISTS (
+    SELECT 1 FROM sys.server_principals
+    WHERE name = N'sa' AND is_disabled = 1
+)
+    ALTER LOGIN [sa] ENABLE;
+
+IF IS_SRVROLEMEMBER(N'sysadmin', N'sa') <> 1
+    ALTER SERVER ROLE [sysadmin] ADD MEMBER [sa];
 
 SELECT
     name,
@@ -1726,10 +1748,11 @@ WHERE name = N'sa';
         die "MSSQL: could not read [sa] recovery state."
 
     sa_state="$(printf '%s\n' "$sa_state" | tr -d '\r' | tail -n 1)"
-    [[ "$sa_state" == '0|1' ]] ||
-        die "MSSQL: recovery login [sa] verification failed: $sa_state"
 
-    log "MSSQL: recovery account OK: sa|ENABLED|SYSADMIN"
+    [[ "$sa_state" == "0|1" ]] ||
+        die "MSSQL: native recovery login [sa] verification failed: '$sa_state' (expected 0|1)."
+
+    log "MSSQL: recovery login OK: sa|ENABLED|SYSADMIN"
 }
 
 restore_mssql() {
