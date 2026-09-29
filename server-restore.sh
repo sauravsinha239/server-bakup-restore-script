@@ -1233,79 +1233,59 @@ pg_prepare_globals() {
 
     while IFS= read -r line || [[ -n "$line" ]]; do
 
-        # ================================================================
-        # PROTECT NATIVE POSTGRES RECOVERY ACCOUNT
-        # ================================================================
-        #
-        # Examples:
-        #
-        # ALTER ROLE postgres NOLOGIN;
-        #
-        # ALTER ROLE postgres WITH SUPERUSER INHERIT
-        #     CREATEROLE CREATEDB NOLOGIN REPLICATION BYPASSRLS;
-        #
-        # Only modify the native "postgres" role.
-        # Other backup roles remain untouched.
-        # ================================================================
+    # Protect native PostgreSQL recovery account.
+    #
+    # Example:
+    # ALTER ROLE postgres WITH SUPERUSER INHERIT CREATEROLE CREATEDB NOLOGIN REPLICATION BYPASSRLS;
+    #
+    # becomes:
+    # ALTER ROLE postgres WITH SUPERUSER INHERIT CREATEROLE CREATEDB LOGIN REPLICATION BYPASSRLS;
 
-        if [[ "$line" =~ ^[[:space:]]*ALTER[[:space:]]+ROLE[[:space:]]+(\"postgres\"|postgres)([[:space:]]+.*);[[:space:]]*$ ]]; then
+    if [[ "$line" == ALTER\ ROLE\ postgres* ]] ||
+       [[ "$line" == ALTER\ ROLE\ \"postgres\"* ]]; then
 
-            if [[ "$line" =~ [[:space:]]NOLOGIN([[:space:]]|;) ]]; then
+        if [[ "$line" == *NOLOGIN* ]]; then
+            log "PostgreSQL: protecting native recovery role from NOLOGIN:"
+            log "  $line"
 
-                log "PostgreSQL: protecting native recovery role from NOLOGIN:"
-                log "  $line"
+            line="${line//NOLOGIN/LOGIN}"
 
-                # Replace ONLY the NOLOGIN token.
-                line="$(printf '%s\n' "$line" | sed -E 's/[[:space:]]NOLOGIN([[:space:]]|;)/ LOGIN\1/I')"
-
-                log "PostgreSQL: protected statement:"
-                log "  $line"
-            fi
+            log "PostgreSQL: protected statement:"
+            log "  $line"
         fi
+    fi
 
-        # ================================================================
-        # EXISTING ROLE HANDLING
-        # ================================================================
+    # Existing-role handling
+    if [[ "$line" =~ $create_role_re ]]; then
 
-        if [[ "$line" =~ $create_role_re ]]; then
+        decl="${BASH_REMATCH[1]}"
 
-            decl="${BASH_REMATCH[1]}"
+        if [[ "${decl:0:1}" == '"' ]]; then
+            role_name="$(
+                printf '%s\n' "$decl" |
+                    sed -E 's/^"(([^"]|"")*)".*/\1/'
+            )"
 
-            if [[ "${decl:0:1}" == '"' ]]; then
-
-                role_name="$(
-                    printf '%s\n' "$decl" |
-                        sed -E 's/^"(((""|[^"])*)).*/\1/'
-                )"
-
-                role_name="${role_name//\"\"/\"}"
-
-            else
-
-                role_name="${decl%%[[:space:]]*}"
-                role_name="${role_name%;}"
-
-            fi
-
-            if [[ -n "${existing[$role_name]+yes}" ]]; then
-
-                printf -- \
-                    '-- RESTORE-SKIPPED existing role: %s\n' \
-                    "$role_name" >> "$output"
-
-            else
-
-                printf '%s\n' "$line" >> "$output"
-
-            fi
+            role_name="${role_name//\"\"/\"}"
 
         else
-
-            printf '%s\n' "$line" >> "$output"
-
+            role_name="${decl%%[[:space:]]*}"
+            role_name="${role_name%;}"
         fi
 
-    done < "$input"
+        if [[ -n "${existing[$role_name]+yes}" ]]; then
+            printf -- \
+                '-- RESTORE-SKIPPED existing role: %s\n' \
+                "$role_name" >> "$output"
+        else
+            printf '%s\n' "$line" >> "$output"
+        fi
+
+    else
+        printf '%s\n' "$line" >> "$output"
+    fi
+
+done < "$input"
 
     # ================================================================
     # FINAL SAFETY NET
