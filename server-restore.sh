@@ -11,11 +11,17 @@ umask 077
 # IMPORTANT:
 # - Database restores are destructive when the target database already exists.
 # - Nginx/SSL are validated before the new Nginx config is activated.
-# - Firewall and SSH restoration are OFF by default.
+# - Firewall and SSH restoration are OFF by default in the checkbox menu.
 # - Temporary extracted files are retained by default.
 
-SCRIPT_VERSION="2.4.1"
+SCRIPT_VERSION="2.5.0"
 ARCHIVE="${1:-}"
+
+# Normalize the archive path once so every later operation is independent
+# of the caller's current working directory.
+if [[ -n "$ARCHIVE" && -f "$ARCHIVE" ]]; then
+    ARCHIVE="$(realpath "$ARCHIVE")"
+fi
 
 [[ -n "$ARCHIVE" && -f "$ARCHIVE" ]] || {
     echo "Usage: $0 /path/to/server-backup-HOST-DATE.tar.gz"
@@ -53,15 +59,9 @@ cmd() {
     command -v "$1" >/dev/null 2>&1
 }
 
-prompt_yes_no() {
-    local prompt="$1"
-    local default="${2:-N}"
-    local response
-
-    read -r -p "$prompt [y/N]: " response
-    response="${response:-$default}"
-    [[ "$response" =~ ^[Yy]$ ]]
-}
+# -------------------------------------------------------------------
+# Interactive checkbox menu
+# -------------------------------------------------------------------
 
 prompt_with_default() {
     local var_name="$1"
@@ -103,38 +103,69 @@ prompt_password() {
     fi
 }
 
-cleanup() {
-    if [[ -d "$RESTORE_ROOT" ]]; then
-        echo
-        echo "Restore files retained at:"
-        echo "  $RESTORE_ROOT"
-        echo
-        echo "Delete them manually after you have verified the restored server:"
-        echo "  rm -rf -- '$RESTORE_ROOT'"
-    fi
+menu_checkbox() {
+    local title="$1"
+    shift
+    local -a labels=("$@")
+    local -a selected=("${MENU_SELECTED[@]}")
+    local cursor=0
+    local key seq i mark
+
+    [[ -t 0 && -t 1 ]] || return 0
+
+    while true; do
+        printf '\033[2J\033[H'
+        printf '\n'
+        printf '============================================================\n'
+        printf ' %s\n' "$title"
+        printf '============================================================\n\n'
+        printf '  ↑/↓  Move    SPACE  Select/Deselect    ENTER  Continue    q  Quit\n\n'
+
+        for i in "${!labels[@]}"; do
+            if [[ "${selected[$i]}" == 1 ]]; then
+                mark='✓'
+            else
+                mark=' '
+            fi
+
+            if ((i == cursor)); then
+                printf '\033[7m'
+                printf '  [%s] %s\n' "$mark" "${labels[$i]}"
+                printf '\033[0m'
+            else
+                printf '  [%s] %s\n' "$mark" "${labels[$i]}"
+            fi
+        done
+
+        printf '\n'
+        printf '  Selected components will have their required packages\n'
+        printf '  installed/upgraded automatically before restore.\n'
+
+        IFS= read -r -s -n 1 key || die "Unable to read terminal input."
+
+        case "$key" in
+            $'\x1b')
+                IFS= read -r -s -n 2 seq || true
+                case "$seq" in
+                    '[A') ((cursor > 0)) && cursor=$((cursor - 1)) ;;
+                    '[B') ((cursor < ${#labels[@]} - 1)) && cursor=$((cursor + 1)) ;;
+                    '[5~') cursor=$((cursor - 5)); ((cursor < 0)) && cursor=0 ;;
+                    '[6~') cursor=$((cursor + 5)); ((cursor >= ${#labels[@]})) && cursor=$((${#labels[@]} - 1)) ;;
+                esac
+                ;;
+            ' ')
+                selected[$cursor]=$((1 - selected[$cursor]))
+                ;;
+            '')
+                MENU_SELECTED=("${selected[@]}")
+                return 0
+                ;;
+            q|Q)
+                die "Restore cancelled."
+                ;;
+        esac
+    done
 }
-trap cleanup EXIT
-
-# -------------------------------------------------------------------
-# Restore selection
-# -------------------------------------------------------------------
-
-RESTORE_WWW=1
-RESTORE_NGINX=1
-RESTORE_POSTGRES=1
-RESTORE_MONGO=1
-RESTORE_MSSQL=0
-RESTORE_SYSTEMD=1
-RESTORE_CROWDSEC=1
-RESTORE_DOCKER=1
-RESTORE_FIREWALL=0
-RESTORE_SSH=0
-
-# Package management:
-# - Selected packages are always installed at the newest repository version.
-# - Existing selected packages are upgraded when required.
-# - A full OS distribution upgrade is NOT performed automatically.
-UPGRADE_SELECTED_PACKAGES=1
 
 choose_components() {
     echo
@@ -145,175 +176,256 @@ choose_components() {
     echo "Archive:"
     echo "  $ARCHIVE"
     echo
-    echo "Answer Y/N for each component."
-    echo "Firewall and SSH are intentionally OFF by default."
-    echo
 
-    prompt_yes_no "Restore /var/www?" Y && RESTORE_WWW=1 || RESTORE_WWW=0
-    prompt_yes_no "Restore Nginx + Let's Encrypt?" Y && RESTORE_NGINX=1 || RESTORE_NGINX=0
-    prompt_yes_no "Restore PostgreSQL?" Y && RESTORE_POSTGRES=1 || RESTORE_POSTGRES=0
-    prompt_yes_no "Restore MongoDB?" Y && RESTORE_MONGO=1 || RESTORE_MONGO=0
-    prompt_yes_no "Restore Microsoft SQL Server?" N && RESTORE_MSSQL=1 || RESTORE_MSSQL=0
-    prompt_yes_no "Restore custom systemd units?" Y && RESTORE_SYSTEMD=1 || RESTORE_SYSTEMD=0
-    prompt_yes_no "Restore CrowdSec?" Y && RESTORE_CROWDSEC=1 || RESTORE_CROWDSEC=0
-    prompt_yes_no "Restore Docker volumes?" Y && RESTORE_DOCKER=1 || RESTORE_DOCKER=0
-    prompt_yes_no "Restore firewall?" N && RESTORE_FIREWALL=1 || RESTORE_FIREWALL=0
-    prompt_yes_no "Restore SSH configuration?" N && RESTORE_SSH=1 || RESTORE_SSH=0
+    local -a labels=(
+        "/var/www"
+        "Nginx + Let's Encrypt"
+        "PostgreSQL"
+        "MongoDB"
+        "Microsoft SQL Server"
+        "Custom systemd units"
+        "CrowdSec configuration"
+        "Docker volumes"
+        "Firewall rules"
+        "SSH configuration"
+    )
+
+    # Defaults: common application/runtime pieces ON; MSSQL/firewall/SSH OFF.
+    MENU_SELECTED=(1 1 1 1 0 1 1 1 0 0)
+    menu_checkbox "SELECT RESTORE COMPONENTS" "${labels[@]}"
+
+    RESTORE_WWW="${MENU_SELECTED[0]}"
+    RESTORE_NGINX="${MENU_SELECTED[1]}"
+    RESTORE_POSTGRES="${MENU_SELECTED[2]}"
+    RESTORE_MONGO="${MENU_SELECTED[3]}"
+    RESTORE_MSSQL="${MENU_SELECTED[4]}"
+    RESTORE_SYSTEMD="${MENU_SELECTED[5]}"
+    RESTORE_CROWDSEC="${MENU_SELECTED[6]}"
+    RESTORE_DOCKER="${MENU_SELECTED[7]}"
+    RESTORE_FIREWALL="${MENU_SELECTED[8]}"
+    RESTORE_SSH="${MENU_SELECTED[9]}"
 
     echo
-    echo "Selected:"
-    printf '  WWW       : %s\n' "$RESTORE_WWW"
-    printf '  Nginx     : %s\n' "$RESTORE_NGINX"
-    printf '  PostgreSQL: %s\n' "$RESTORE_POSTGRES"
-    printf '  MongoDB   : %s\n' "$RESTORE_MONGO"
-    printf '  MSSQL     : %s\n' "$RESTORE_MSSQL"
-    printf '  systemd   : %s\n' "$RESTORE_SYSTEMD"
-    printf '  CrowdSec  : %s\n' "$RESTORE_CROWDSEC"
-    printf '  Docker    : %s\n' "$RESTORE_DOCKER"
-    printf '  Firewall  : %s\n' "$RESTORE_FIREWALL"
-    printf '  SSH       : %s\n' "$RESTORE_SSH"
+    echo "Selected components:"
+    printf '  /var/www                 : %s\n' "$RESTORE_WWW"
+    printf "  Nginx + Let\'s Encrypt     : %s\n" "$RESTORE_NGINX"
+    printf '  PostgreSQL                : %s\n' "$RESTORE_POSTGRES"
+    printf '  MongoDB                   : %s\n' "$RESTORE_MONGO"
+    printf '  Microsoft SQL Server     : %s\n' "$RESTORE_MSSQL"
+    printf '  systemd                   : %s\n' "$RESTORE_SYSTEMD"
+    printf '  CrowdSec                  : %s\n' "$RESTORE_CROWDSEC"
+    printf '  Docker                    : %s\n' "$RESTORE_DOCKER"
+    printf '  Firewall                  : %s\n' "$RESTORE_FIREWALL"
+    printf '  SSH                       : %s\n' "$RESTORE_SSH"
     echo
-
-    prompt_yes_no "Continue with this restore?" N ||
-        die "Restore cancelled."
 }
 
 # -------------------------------------------------------------------
 # Package bootstrap / upgrade
 # -------------------------------------------------------------------
 
+APT_DISABLED_REPOS=()
+
+restore_apt_repositories() {
+    local f original
+    for f in "${APT_DISABLED_REPOS[@]:-}"; do
+        [[ -f "$f" ]] || continue
+        original="${f%.restore-disabled}"
+        mv -f -- "$f" "$original" || warn "Could not restore APT repository file: $original"
+    done
+    APT_DISABLED_REPOS=()
+}
+
+setup_mongodb_apt_repo() {
+    local id="$1" version_codename="$2" arch
+    arch="$(dpkg --print-architecture)"
+
+    case "$id:$version_codename" in
+        ubuntu:noble|ubuntu:jammy|ubuntu:focal)
+            ;;
+        debian:bookworm)
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    cmd curl || apt-get install -y curl
+    cmd gpg || apt-get install -y gnupg
+
+    install -d -m 0755 /usr/share/keyrings
+    curl -fsSL https://pgp.mongodb.com/server-8.0.asc |
+        gpg --dearmor --yes -o /usr/share/keyrings/mongodb-server-8.0.gpg
+    chmod 0644 /usr/share/keyrings/mongodb-server-8.0.gpg
+
+    local list_file="/etc/apt/sources.list.d/mongodb-org-8.0.list"
+    if [[ "$id" == "ubuntu" ]]; then
+        cat > "$list_file" <<EOF
+# Managed by server-restore.sh
+# MongoDB Community 8.0 official repository
+ deb [ arch=${arch} signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg ] https://repo.mongodb.org/apt/ubuntu ${version_codename}/mongodb-org/8.0 multiverse
+EOF
+    else
+        cat > "$list_file" <<EOF
+# Managed by server-restore.sh
+# MongoDB Community 8.0 official repository
+ deb [ arch=${arch} signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg ] https://repo.mongodb.org/apt/debian ${version_codename}/mongodb-org/8.0 main
+EOF
+    fi
+    sed -i 's/^ deb/deb/' "$list_file"
+    chmod 0644 "$list_file"
+    log "MongoDB: official MongoDB 8.0 APT repository configured."
+}
+
+setup_mssql_apt_repo() {
+    local version_id="$1"
+
+    [[ "$ID" == "ubuntu" ]] || return 1
+
+    cmd curl || apt-get install -y curl
+    cmd gpg || apt-get install -y gnupg
+
+    case "$version_id" in
+        24.04)
+            local repo_url="https://packages.microsoft.com/config/ubuntu/24.04/mssql-server-2025.list"
+            ;;
+        22.04)
+            local repo_url="https://packages.microsoft.com/config/ubuntu/22.04/mssql-server-2025.list"
+            ;;
+        20.04)
+            local repo_url="https://packages.microsoft.com/config/ubuntu/20.04/mssql-server-2022.list"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    install -d -m 0755 /usr/share/keyrings
+    curl -fsSL https://packages.microsoft.com/keys/microsoft.asc |
+        gpg --dearmor --yes -o /usr/share/keyrings/microsoft-prod.gpg
+    chmod 0644 /usr/share/keyrings/microsoft-prod.gpg
+
+    local list_file="/etc/apt/sources.list.d/mssql-server-restore.list"
+    curl -fsSL "$repo_url" -o "$list_file"
+    chmod 0644 "$list_file"
+    log "MSSQL: Microsoft SQL Server repository configured for Ubuntu ${version_id}."
+}
+
 install_selected_packages() {
     [[ -f /etc/os-release ]] || return 0
     # shellcheck disable=SC1091
     source /etc/os-release
-
-    if ! prompt_yes_no "Install/upgrade required packages before restoring?" Y; then
-        return 0
-    fi
 
     case "$ID" in
         ubuntu|debian)
             export DEBIAN_FRONTEND=noninteractive
 
             local microsoft_files=()
-            local disabled_files=()
-            local ms_key="/usr/share/keyrings/microsoft-prod.gpg"
+            local ms_source
 
-            # Disable Microsoft repositories while restoring the normal
-            # platform packages unless MSSQL was explicitly selected.
+            # If MSSQL is not selected, temporarily disable Microsoft APT
+            # sources so an unrelated/broken third-party source cannot block
+            # installation of the restore dependencies.
             if [[ "$RESTORE_MSSQL" != 1 ]]; then
                 while IFS= read -r -d '' f; do
                     microsoft_files+=("$f")
                 done < <(
                     grep -RIlZE \
-                        'packages\.microsoft\.com|packages\.microsoft\.com/ubuntu' \
+                        'packages\.microsoft\.com' \
                         /etc/apt/sources.list /etc/apt/sources.list.d \
                         2>/dev/null || true
                 )
 
                 for f in "${microsoft_files[@]}"; do
                     [[ -f "$f" ]] || continue
-                    local disabled="${f}.restore-disabled"
-                    mv "$f" "$disabled"
-                    disabled_files+=("$disabled")
-                    log "Temporarily disabled third-party Microsoft repo: $f"
+                    ms_source="${f}.restore-disabled"
+                    mv -f -- "$f" "$ms_source"
+                    APT_DISABLED_REPOS+=("$ms_source")
+                    log "Temporarily disabled Microsoft APT source: $f"
                 done
             fi
 
-            restore_apt_repositories() {
-                local f
-                for f in "${disabled_files[@]}"; do
-                    [[ -f "$f" ]] || continue
-                    mv "$f" "${f%.restore-disabled}"
-                    log "Re-enabled repository: ${f%.restore-disabled}"
-                done
-            }
-
-            # Always restore repositories on function exit, including failures.
-            trap restore_apt_repositories RETURN
-
-            if [[ "$RESTORE_MSSQL" == 1 ]]; then
-                # MSSQL restore requires the Microsoft repository. Repair the
-                # key if it exists but is invalid.
-                if [[ -f "$ms_key" ]] &&
-                   ! gpg --quiet --batch --list-packets "$ms_key" >/dev/null 2>&1; then
-                    log "Existing Microsoft repository key is invalid. Recreating it..."
-                    rm -f "$ms_key"
-                fi
-
-                if [[ ! -f "$ms_key" ]]; then
-                    cmd curl || apt-get install -y curl
-                    cmd gpg || apt-get install -y gnupg
-                    mkdir -p /usr/share/keyrings
-                    curl -fsSL https://packages.microsoft.com/keys/microsoft.asc |
-                        gpg --dearmor --yes -o "$ms_key"
-                    chmod 0644 "$ms_key"
-                else
-                    chmod 0644 "$ms_key"
-                fi
-            fi
-
-            log "Updating APT package indexes..."
+            log "Installing/upgrading base restore tools..."
             apt-get update
 
-            local pkgs=(tar gzip coreutils)
+            local -a pkgs=(tar gzip coreutils ca-certificates curl gnupg)
             [[ "$RESTORE_NGINX" == 1 ]]    && pkgs+=(nginx)
-            [[ "$RESTORE_POSTGRES" == 1 ]] && pkgs+=(postgresql-client)
+            [[ "$RESTORE_POSTGRES" == 1 ]] && pkgs+=(postgresql postgresql-client)
             [[ "$RESTORE_DOCKER" == 1 ]]   && pkgs+=(docker.io)
             [[ "$RESTORE_SSH" == 1 ]]      && pkgs+=(openssh-server)
             [[ "$RESTORE_FIREWALL" == 1 ]] && pkgs+=(ufw iptables nftables)
 
-            # Upgrade packages that are already installed, then install
-            # anything missing. This gives us the newest available package
-            # without performing a risky full distro upgrade.
+            # MongoDB official repository on supported Ubuntu/Debian releases.
+            if [[ "$RESTORE_MONGO" == 1 ]]; then
+                if ! cmd mongorestore || ! cmd mongod; then
+                    if setup_mongodb_apt_repo "$ID" "${VERSION_CODENAME:-}"; then
+                        apt-get update
+                        pkgs+=(mongodb-org)
+                    else
+                        die "MongoDB is not installed and automatic repository setup is unsupported for $ID ${VERSION_ID:-unknown}."
+                    fi
+                fi
+            fi
+
+            # MSSQL official repository + server/tools on supported Ubuntu.
+            if [[ "$RESTORE_MSSQL" == 1 ]]; then
+                if [[ "$ID" != "ubuntu" ]]; then
+                    die "Automatic fresh MSSQL installation is supported here only on Ubuntu. Install Microsoft SQL Server separately on this OS, then rerun the restore."
+                fi
+                if ! cmd sqlcmd || ! cmd mssql-conf || ! cmd systemctl || ! systemctl list-unit-files mssql-server.service >/dev/null 2>&1; then
+                    setup_mssql_apt_repo "$VERSION_ID" ||
+                        die "Unsupported Ubuntu version for the automatic MSSQL restore bootstrap: $VERSION_ID"
+                    apt-get update
+                    pkgs+=(mssql-server mssql-tools18 unixodbc-dev)
+                fi
+            fi
+
             if [[ "$UPGRADE_SELECTED_PACKAGES" == 1 && ${#pkgs[@]} -gt 0 ]]; then
                 log "Upgrading selected restore packages where newer versions are available..."
-                apt-get install -y --only-upgrade "${pkgs[@]}" || \
-                    warn "Some already-installed packages could not be upgraded; continuing with installation."
+                apt-get install -y --only-upgrade "${pkgs[@]}" ||
+                    warn "Some selected packages were not already installed; normal installation will handle them."
             fi
 
             log "Installing required restore packages..."
             apt-get install -y "${pkgs[@]}"
 
+            # Ensure command-line database tools are available when the server
+            # packages are already installed but PATH is not configured.
             if [[ "$RESTORE_MONGO" == 1 ]] && ! cmd mongorestore; then
-                log "MongoDB restore tool not found; installing MongoDB Database Tools..."
-                apt-get install -y mongodb-database-tools 2>/dev/null ||
-                    apt-get install -y mongodb-org-tools 2>/dev/null ||
-                    warn "Could not automatically install MongoDB Database Tools."
-            elif [[ "$RESTORE_MONGO" == 1 && "$UPGRADE_SELECTED_PACKAGES" == 1 ]]; then
-                # MongoDB tools are often supplied separately from the OS repo.
-                apt-get install -y --only-upgrade mongodb-database-tools 2>/dev/null ||
-                    apt-get install -y --only-upgrade mongodb-org-tools 2>/dev/null ||
-                    true
+                [[ -x /usr/bin/mongorestore ]] && ln -sf /usr/bin/mongorestore /usr/local/bin/mongorestore
             fi
 
-            if [[ "$RESTORE_MSSQL" == 1 ]] && ! cmd sqlcmd; then
+            if [[ "$RESTORE_MSSQL" == 1 ]]; then
                 if [[ -x /opt/mssql-tools18/bin/sqlcmd ]]; then
                     ln -sf /opt/mssql-tools18/bin/sqlcmd /usr/local/bin/sqlcmd
-                else
-                    warn "sqlcmd is not installed. MSSQL restore will be skipped."
                 fi
+                cmd sqlcmd || die "sqlcmd is not available after MSSQL tools installation."
+                [[ -x /opt/mssql/bin/mssql-conf ]] || die "mssql-conf is not available after MSSQL installation."
             fi
 
-            # Remove RETURN trap before explicitly restoring repositories.
-            trap - RETURN
             restore_apt_repositories
             ;;
 
         arch)
-            # pacman -Syu is the correct Arch operation: refresh package
-            # databases and perform a complete, dependency-consistent system
-            # upgrade before installing selected restore packages.
             log "Synchronizing Arch repositories and upgrading the system..."
             pacman -Syu --noconfirm --needed
 
-            local pkgs=()
+            local -a pkgs=()
             [[ "$RESTORE_NGINX" == 1 ]]    && pkgs+=(nginx)
             [[ "$RESTORE_POSTGRES" == 1 ]] && pkgs+=(postgresql)
             [[ "$RESTORE_DOCKER" == 1 ]]   && pkgs+=(docker)
             [[ "$RESTORE_SSH" == 1 ]]      && pkgs+=(openssh)
             [[ "$RESTORE_FIREWALL" == 1 ]] && pkgs+=(ufw iptables-nft nftables)
-            [[ "$RESTORE_MONGO" == 1 ]]    && pkgs+=(mongodb-tools)
+
+            if [[ "$RESTORE_MONGO" == 1 ]]; then
+                if ! cmd mongorestore; then
+                    die "MongoDB Database Tools are not installed on Arch. Install mongorestore from your approved repository/AUR first."
+                fi
+            fi
+
+            if [[ "$RESTORE_MSSQL" == 1 ]]; then
+                die "Automatic fresh MSSQL installation is not provided for Arch. Install a supported Microsoft SQL Server Linux package separately, then rerun the restore."
+            fi
 
             if ((${#pkgs[@]})); then
                 log "Installing/upgrading selected Arch restore packages..."
@@ -612,6 +724,79 @@ sql_literal_escape() {
     printf '%s' "${value//\'/\'\'}"
 }
 
+restore_postgres_globals_prepare() {
+    local input="$1"
+    local output="$RESTORE_ROOT/POSTGRES/globals.restore.sql"
+    local line decl role_name
+    local -a existing_roles=()
+    declare -A existing_role_map=()
+
+    while IFS= read -r role_name; do
+        [[ -n "$role_name" ]] || continue
+        existing_role_map["$role_name"]=1
+    done < <(
+        runuser -u postgres -- psql -Atqc "SELECT rolname FROM pg_roles;"
+    )
+
+    : > "$output"
+
+    local create_role_re='^CREATE[[:space:]]+ROLE[[:space:]]+(.+);[[:space:]]*$'
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ $create_role_re ]]; then
+            decl="${BASH_REMATCH[1]}"
+            role_name="$decl"
+
+            # pg_dumpall normally emits CREATE ROLE <identifier>;
+            # support both quoted and unquoted identifiers here.
+            if [[ "${role_name:0:1}" == '"' && "${role_name: -1}" == '"' ]]; then
+                role_name="${role_name:1:${#role_name}-2}"
+                role_name="$(printf '%s' "$role_name" | sed 's/""/"/g')"
+            fi
+
+            if [[ -n "${existing_role_map[$role_name]+x}" ]]; then
+                printf '%s\n' "-- RESTORE SKIPPED: role '$role_name' already exists."
+            else
+                printf '%s\n' "$line"
+            fi
+        else
+            printf '%s\n' "$line"
+        fi
+    done < "$input" > "$output"
+
+    chown postgres:postgres "$output"
+    chmod 600 "$output"
+    printf '%s\n' "$output"
+}
+
+set_new_postgres_password() {
+    local pg_user="$1"
+    local p1 p2
+
+    echo
+    echo "PostgreSQL '$pg_user' password can be replaced with a new password."
+    echo "This is useful on a fresh disaster-recovery server because the old password may be unknown."
+
+    while true; do
+        read -r -s -p "New PostgreSQL password for '$pg_user': " p1
+        echo
+        read -r -s -p "Confirm PostgreSQL password: " p2
+        echo
+
+        [[ -n "$p1" ]] || { warn "PostgreSQL password cannot be empty."; continue; }
+        [[ "$p1" == "$p2" ]] || { warn "PostgreSQL passwords do not match."; continue; }
+
+        runuser -u postgres -- psql -v ON_ERROR_STOP=1 \
+            -c "ALTER ROLE $(sql_ident_escape "$pg_user") PASSWORD '$(sql_literal_escape "$p1")';" \
+            && break
+
+        warn "PostgreSQL password change failed. Try again."
+    done
+
+    unset p1 p2
+    log "PostgreSQL: new password configured successfully for '$pg_user'."
+}
+
 restore_postgres() {
     [[ "$RESTORE_POSTGRES" == 1 ]] || return 0
     [[ -d "$TREE/POSTGRES/databases" ]] || {
@@ -622,22 +807,18 @@ restore_postgres() {
     cmd psql || die "psql is required for PostgreSQL restore."
     cmd pg_restore || die "pg_restore is required for PostgreSQL restore."
     cmd runuser || die "runuser is required for local PostgreSQL restore."
+    id postgres >/dev/null 2>&1 || die "PostgreSQL OS user 'postgres' does not exist."
 
     log "[6] Restoring PostgreSQL"
     log "PostgreSQL: preparing backup ownership and permissions..."
 
-    # The archive is extracted with --numeric-owner, so files can retain
-    # UIDs/GIDs from the old server. Local PostgreSQL commands run as the
-    # postgres OS account; make the complete PostgreSQL backup tree readable.
     chown -R postgres:postgres "$TREE/POSTGRES" ||
         die "Could not assign PostgreSQL backup ownership to postgres."
     chmod -R u+rwX "$TREE/POSTGRES" ||
         die "Could not set PostgreSQL backup permissions."
 
-    # The restore workspace is intentionally created with umask 077.
-    # That protects the backup, but it also prevents the postgres OS user
-    # from traversing the parent directories. Grant traverse-only access;
-    # this does NOT grant postgres permission to list or read the parent.
+    # RESTORE_ROOT/TREE are private by default (umask 077). Grant only
+    # traversal to allow the postgres OS account to reach its own files.
     chmod o+x "$RESTORE_ROOT" "$TREE" ||
         die "Could not grant PostgreSQL traverse permission to restore workspace."
 
@@ -651,8 +832,8 @@ restore_postgres() {
     local pg_host="${PG_HOST:-}"
     local pg_port="${PG_PORT:-}"
     local use_local_auth=0
-
     local -a PSQL_BASE
+
     PSQL_BASE=(psql -v ON_ERROR_STOP=1)
 
     if [[ -n "$pg_host" ]]; then
@@ -683,14 +864,21 @@ restore_postgres() {
         fi
     }
 
-    # Restore roles/tablespaces/global objects first.
     if [[ -f "$TREE/POSTGRES/globals.sql" ]]; then
-        log "PostgreSQL: restoring globals.sql..."
-        if ! pg_exec -d postgres -f "$TREE/POSTGRES/globals.sql"; then
+        log "PostgreSQL: preparing globals.sql for idempotent role restore..."
+        local globals_restore
+        if ((use_local_auth)); then
+            globals_restore="$(restore_postgres_globals_prepare "$TREE/POSTGRES/globals.sql")"
+        else
+            globals_restore="$TREE/POSTGRES/globals.sql"
+        fi
+
+        log "PostgreSQL: restoring global roles/privileges..."
+        if ! pg_exec -d postgres -f "$globals_restore"; then
             unset PGPASSWORD
             die "PostgreSQL globals restore failed."
         fi
-        log "PostgreSQL: globals restored successfully."
+        log "PostgreSQL: globals restored successfully. Existing roles were preserved without duplicate CREATE ROLE errors."
     fi
 
     local -a dumps=()
@@ -702,6 +890,9 @@ restore_postgres() {
     total=${#dumps[@]}
     if ((total == 0)); then
         unset PGPASSWORD
+        if ((use_local_auth)) && [[ "$pg_user" == "postgres" ]]; then
+            set_new_postgres_password "$pg_user"
+        fi
         warn "No PostgreSQL database dumps found."
         return 0
     fi
@@ -751,6 +942,11 @@ restore_postgres() {
     done
 
     unset PGPASSWORD
+
+    if ((use_local_auth)) && [[ "$pg_user" == "postgres" ]]; then
+        set_new_postgres_password "$pg_user"
+    fi
+
     log "PostgreSQL: restore completed successfully ($total database(s))."
 }
 
@@ -766,14 +962,13 @@ restore_mongo() {
     }
 
     cmd mongorestore || die "mongorestore is required for MongoDB restore."
+    cmd mongod || warn "mongod binary was not found; assuming MongoDB is provided by an external service."
 
     log "[7] Restoring MongoDB"
     log "MongoDB: preparing backup ownership and permissions..."
 
-    # mongorestore is intentionally executed by root below, but keep the
-    # extracted backup private and assign it to the MongoDB service account
-    # when that account exists. This also makes the backup safe to consume if
-    # the restore command is later changed to run as mongodb.
+    # The restore process itself runs as root, but the backup file is kept
+    # private and assigned to the service account when it exists.
     if id mongodb >/dev/null 2>&1; then
         chown mongodb:mongodb "$TREE/MONGODB/mongodb.archive.gz" ||
             die "Could not assign MongoDB backup ownership."
@@ -789,9 +984,11 @@ restore_mongo() {
     if systemctl list-unit-files mongod.service >/dev/null 2>&1; then
         systemctl enable mongod 2>/dev/null || true
         systemctl start mongod || die "MongoDB service could not be started."
+        systemctl is-active --quiet mongod || die "MongoDB service is not active."
     elif systemctl list-unit-files mongodb.service >/dev/null 2>&1; then
         systemctl enable mongodb 2>/dev/null || true
         systemctl start mongodb || die "MongoDB service could not be started."
+        systemctl is-active --quiet mongodb || die "MongoDB service is not active."
     else
         die "MongoDB service unit not found."
     fi
@@ -800,12 +997,13 @@ restore_mongo() {
     prompt_with_default MONGO_URI "MongoDB URI" "$uri"
     uri="${MONGO_URI:-mongodb://127.0.0.1:27017}"
 
-    log "MongoDB: restoring mongodb.archive.gz..."
+    log "MongoDB: restoring archive..."
     if ! mongorestore \
         --uri="$uri" \
         --archive="$TREE/MONGODB/mongodb.archive.gz" \
         --gzip \
-        --drop; then
+        --drop \
+        --stopOnError; then
         die "MongoDB restore failed."
     fi
 
@@ -826,6 +1024,71 @@ mssql_escape_literal() {
     printf '%s' "${value//\'/\'\'}"
 }
 
+mssql_validate_password() {
+    local p="$1"
+    local len count=0
+    len=${#p}
+
+    ((len >= 8 && len <= 128)) || return 1
+    [[ "$p" =~ [A-Z] ]] && count=$((count + 1))
+    [[ "$p" =~ [a-z] ]] && count=$((count + 1))
+    [[ "$p" =~ [0-9] ]] && count=$((count + 1))
+    [[ "$p" =~ [^A-Za-z0-9] ]] && count=$((count + 1))
+
+    ((count >= 3))
+}
+
+prompt_mssql_sa_password() {
+    local p1 p2
+    while true; do
+        read -r -s -p "NEW MSSQL sa password: " p1
+        echo
+        read -r -s -p "Confirm NEW MSSQL sa password: " p2
+        echo
+
+        [[ "$p1" == "$p2" ]] || { warn "MSSQL passwords do not match."; continue; }
+        mssql_validate_password "$p1" || {
+            warn "MSSQL password must be 8-128 characters and contain characters from at least 3 of: uppercase, lowercase, number, symbol."
+            continue
+        }
+        MSSQL_NEW_SA_PASSWORD="$p1"
+        unset p1 p2
+        return 0
+    done
+}
+
+setup_fresh_mssql_if_needed() {
+    local server_conf="/var/opt/mssql/mssql.conf"
+    local pid="${MSSQL_PID:-Developer}"
+
+    [[ -x /opt/mssql/bin/mssql-conf ]] || die "mssql-conf is not installed."
+
+    # Native package installs require an initial mssql-conf setup. Detect a
+    # configured instance by the presence of the EULA acceptance setting.
+    if [[ -f "$server_conf" ]] && grep -qiE '^[[:space:]]*accepteula[[:space:]]*=[[:space:]]*[Yy]' "$server_conf"; then
+        return 0
+    fi
+
+    echo
+    echo "Fresh SQL Server installation detected."
+    echo "A NEW sa password is required; the old server password is not needed."
+    prompt_with_default MSSQL_PID "MSSQL edition/product ID" "$pid"
+    pid="$MSSQL_PID"
+    prompt_mssql_sa_password
+
+    log "MSSQL: performing unattended first-time setup..."
+    if ! ACCEPT_EULA=Y MSSQL_PID="$pid" MSSQL_SA_PASSWORD="$MSSQL_NEW_SA_PASSWORD" \
+        /opt/mssql/bin/mssql-conf -n setup; then
+        unset MSSQL_NEW_SA_PASSWORD
+        die "MSSQL first-time setup failed."
+    fi
+
+    MSSQL_PASSWORD="$MSSQL_NEW_SA_PASSWORD"
+    unset MSSQL_NEW_SA_PASSWORD
+    systemctl enable mssql-server >/dev/null 2>&1 || true
+    systemctl restart mssql-server || die "MSSQL service failed to start after initial setup."
+}
+
 restore_mssql() {
     [[ "$RESTORE_MSSQL" == 1 ]] || return 0
     [[ -d "$TREE/MSSQL/bak" ]] || {
@@ -836,36 +1099,43 @@ restore_mssql() {
     cmd sqlcmd || die "sqlcmd is required for MSSQL restore."
 
     log "[8] Restoring Microsoft SQL Server"
-    systemctl start mssql-server 2>/dev/null || true
+    setup_fresh_mssql_if_needed
 
     local server="${MSSQL_SERVER:-127.0.0.1,1433}"
-    local user="${MSSQL_USER:-}"
+    local user="${MSSQL_USER:-sa}"
     local password="${MSSQL_PASSWORD:-}"
 
     prompt_with_default MSSQL_SERVER "MSSQL server" "$server"
     server="$MSSQL_SERVER"
-    prompt_with_default MSSQL_USER "MSSQL username" "${user:-sa}"
+
+    prompt_with_default MSSQL_USER "MSSQL username" "$user"
     user="$MSSQL_USER"
-    prompt_password MSSQL_PASSWORD "MSSQL user '$user'"
-    password="${MSSQL_PASSWORD:-}"
+
+    if [[ -z "$password" ]]; then
+        prompt_password MSSQL_PASSWORD "MSSQL user '$user'"
+        password="${MSSQL_PASSWORD:-}"
+    fi
+
+    [[ -n "$password" ]] || die "MSSQL password is required for SQL restore."
+
+    # SQLCMDPASSWORD avoids putting the SA password in the process command line.
+    export SQLCMDPASSWORD="$password"
 
     local -a SQLCMD
-    SQLCMD=(sqlcmd -S "$server" -C -b)
-    [[ -n "$user" ]] && SQLCMD+=(-U "$user" -P "$password")
+    SQLCMD=(sqlcmd -S "$server" -C -b -U "$user")
 
-    "${SQLCMD[@]}" -Q "SELECT @@SERVERNAME AS ServerName, SERVERPROPERTY('Edition') AS Edition;" \
-        > "$TREE/MSSQL/restore-server-info.txt" 2>&1 ||
+    local server_info="$TREE/MSSQL/restore-server-info.txt"
+    if ! "${SQLCMD[@]}" -Q "SELECT @@SERVERNAME AS ServerName, SERVERPROPERTY('Edition') AS Edition, SERVERPROPERTY('ProductVersion') AS ProductVersion;" > "$server_info" 2>&1; then
+        unset SQLCMDPASSWORD MSSQL_PASSWORD
         die "Cannot connect to MSSQL with the supplied credentials."
+    fi
 
-    # SQL Server reads backup files as the mssql service account, not as root.
-    # Stage .bak files into the SQL Server backup directory and explicitly
-    # assign ownership/permissions so restore works on a fresh server.
+    # SQL Server reads .bak files as the mssql service account. Stage them in
+    # its native backup directory with strict ownership and permissions.
     local mssql_backup_dir="/var/opt/mssql/backup"
     mkdir -p "$mssql_backup_dir"
-    chown mssql:mssql "$mssql_backup_dir" ||
-        die "Could not assign MSSQL backup directory ownership."
-    chmod 750 "$mssql_backup_dir" ||
-        die "Could not set MSSQL backup directory permissions."
+    chown mssql:mssql "$mssql_backup_dir" || die "Could not assign MSSQL backup directory ownership."
+    chmod 750 "$mssql_backup_dir" || die "Could not set MSSQL backup directory permissions."
 
     log "MSSQL: staging backup files into $mssql_backup_dir..."
 
@@ -873,14 +1143,14 @@ restore_mssql() {
     local -a baks=( "$TREE"/MSSQL/bak/*.bak )
     shopt -u nullglob
 
-    ((${#baks[@]})) || {
-        unset MSSQL_PASSWORD
+    local total=${#baks[@]}
+    if ((total == 0)); then
+        unset SQLCMDPASSWORD MSSQL_PASSWORD
         warn "No MSSQL .bak files found."
         return 0
-    }
+    fi
 
     local bak staged_bak db qdb qpath logical_data logical_log data_file log_file sql
-    local total=${#baks[@]}
     local index=0
 
     for bak in "${baks[@]}"; do
@@ -896,8 +1166,7 @@ restore_mssql() {
         qpath="$(mssql_escape_literal "$staged_bak")"
 
         log "MSSQL [$index/$total]: verifying backup '$db'..."
-        if ! "${SQLCMD[@]}" -Q \
-            "RESTORE VERIFYONLY FROM DISK=N'$qpath';"; then
+        if ! "${SQLCMD[@]}" -Q "RESTORE VERIFYONLY FROM DISK=N'$qpath';"; then
             die "MSSQL backup verification failed: $db"
         fi
         log "MSSQL [$index/$total]: backup verification OK."
@@ -908,7 +1177,6 @@ restore_mssql() {
                 "RESTORE FILELISTONLY FROM DISK=N'$qpath';" |
                 awk -F'|' '$3 == "D" || $3 == "ROWS" {print $1; exit}'
         )"
-
         logical_log="$(
             "${SQLCMD[@]}" -h -1 -W -s '|' -Q \
                 "RESTORE FILELISTONLY FROM DISK=N'$qpath';" |
@@ -922,12 +1190,12 @@ restore_mssql() {
             die "Could not determine logical data/log files for MSSQL database: $db"
         fi
 
-        data_file="/var/opt/mssql/data/${db}.mdf"
-        log_file="/var/opt/mssql/data/${db}_log.ldf"
-
         mkdir -p /var/opt/mssql/data
         chown mssql:mssql /var/opt/mssql/data
         chmod 750 /var/opt/mssql/data
+
+        data_file="/var/opt/mssql/data/${db}.mdf"
+        log_file="/var/opt/mssql/data/${db}_log.ldf"
 
         sql="
 IF DB_ID(N'$(mssql_escape_literal "$db")') IS NOT NULL
@@ -960,7 +1228,7 @@ ALTER DATABASE [$qdb] SET MULTI_USER;
         log "MSSQL [$index/$total]: database '$db' restored successfully."
     done
 
-    unset MSSQL_PASSWORD
+    unset SQLCMDPASSWORD MSSQL_PASSWORD
     log "MSSQL: restore completed successfully ($total database(s))."
 }
 
