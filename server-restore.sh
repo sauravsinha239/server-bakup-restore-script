@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Server Disaster Recovery Restore
-# Version: 4.2.0
+# Version: 4.2.1
 #
 # Design:
 #   1. Preflight and identify OS / architecture
@@ -23,6 +23,9 @@
 #   - SHA verification is independent of stale filenames inside .sha256 files.
 #   - Nginx 1.24.x keeps legacy listen ... http2 syntax.
 #   - Interactive component selection remains enabled.
+#   - PostgreSQL recovery role postgres is explicitly re-enabled after globals restore.
+#   - MSSQL recovery login sa is explicitly enabled after authentication.
+#   - Fresh MSSQL setup always establishes a new recovery password for sa.
 #
 # IMPORTANT:
 #   - Run as root.
@@ -1342,6 +1345,35 @@ start_postgres() {
     die "PostgreSQL could not be started. No usable systemd service, pg_ctlcluster cluster, or pg_ctl data directory was found."
 }
 
+pg_enable_recovery_roles() {
+    # Do NOT enable every role from the backup. Only the local recovery/admin
+    # role is repaired. globals.sql can contain ALTER ROLE postgres NOLOGIN.
+    local recovery_user="${PG_USER:-postgres}"
+    local recovery_ident
+
+    recovery_ident="$(pg_sql_ident "$recovery_user")"
+
+    log "PostgreSQL: ensuring recovery role '$recovery_user' has LOGIN..."
+
+    run_as postgres psql -v ON_ERROR_STOP=1 -d postgres -c \
+        "ALTER ROLE \"$recovery_ident\" LOGIN;" ||
+        die "PostgreSQL: could not enable LOGIN for recovery role '$recovery_user'."
+
+    # postgres is the native local superuser and is the final fallback account.
+    if [[ "$recovery_user" != "postgres" ]]; then
+        run_as postgres psql -v ON_ERROR_STOP=1 -d postgres -c \
+            'ALTER ROLE postgres LOGIN;' ||
+            die "PostgreSQL: could not enable LOGIN for role 'postgres'."
+    fi
+
+    log "PostgreSQL: recovery LOGIN state:"
+    run_as postgres psql -d postgres -Atqc \
+        "SELECT rolname || '|' || CASE WHEN rolcanlogin THEN 'LOGIN' ELSE 'NOLOGIN' END
+         FROM pg_roles
+         WHERE rolname IN ('postgres', '$(pg_sql_literal "$recovery_user")')
+         ORDER BY rolname;" || true
+}
+
 restore_postgres() {
     [[ "$RESTORE_POSTGRES" == 1 ]] || return 0
     [[ -d "$TREE/POSTGRES" ]] || {
@@ -1387,6 +1419,13 @@ restore_postgres() {
             -d postgres \
             -f "$pg_stage/globals.restore.sql" ||
             die "PostgreSQL global restore failed."
+
+        # pg_dumpall globals can contain ALTER ROLE postgres NOLOGIN.
+        # Never allow the backup to lock us out of the fresh recovery server.
+        pg_enable_recovery_roles
+    else
+        # Even without globals.sql, make sure the local recovery account works.
+        pg_enable_recovery_roles
     fi
 
     local -a dumps=()
@@ -1651,6 +1690,32 @@ mssql_sqlcmd() {
         sqlcmd -S "$MSSQL_SERVER" -C -b -U "$MSSQL_USER" "$@"
 }
 
+mssql_enable_recovery_login() {
+    # Keep the built-in sa account as the recovery account.
+    # This must run after a successful SQL authentication.
+    log "MSSQL: ensuring recovery login [sa] is enabled..."
+
+    mssql_sqlcmd -Q "
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.server_principals
+    WHERE name = N'sa'
+)
+BEGIN
+    THROW 50001, 'Built-in recovery login [sa] does not exist.', 1;
+END;
+
+ALTER LOGIN [sa] ENABLE;
+
+SELECT name, is_disabled
+FROM sys.server_principals
+WHERE name = N'sa';
+" ||
+        die "MSSQL: could not enable recovery login [sa]. Current credentials must have sufficient server permissions."
+
+    log "MSSQL: recovery login [sa] is enabled."
+}
+
 restore_mssql() {
     [[ "$RESTORE_MSSQL" == 1 ]] || return 0
     [[ -d "$TREE/MSSQL/bak" ]] || {
@@ -1676,6 +1741,10 @@ restore_mssql() {
     fi
 
     wait_mssql_ready "$MSSQL_SERVER"
+
+    # Restore/backup files cannot be trusted to leave the server-level recovery
+    # login enabled. Fix [sa] before touching any database.
+    mssql_enable_recovery_login
 
     local stage="/var/opt/mssql/restore-staging"
     safe_mkdir "$stage" 0750
@@ -1800,8 +1869,12 @@ ALTER DATABASE [$qdb] SET MULTI_USER;
         log "MSSQL [$i/${#baks[@]}]: OK"
     done
 
+    # Final safety check: database restores are complete, so verify the
+    # server-level recovery account one last time.
+    mssql_enable_recovery_login
+
     unset MSSQL_PASSWORD
-    log "MSSQL restore completed."
+    log "MSSQL restore completed. Recovery login [sa] is enabled."
 }
 
 # ---------------------------------------------------------------------------
