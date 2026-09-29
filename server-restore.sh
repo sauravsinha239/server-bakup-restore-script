@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Server Disaster Recovery Restore
-# Version: 3.1.0
+# Version: 4.0.0
 #
 # Design:
 #   1. Preflight and identify OS / architecture
@@ -20,21 +20,23 @@
 #   - Firewall and SSH restoration are OFF by default.
 #
 # Usage:
-#   sudo ./server-restore-production-3.1.0.sh /path/to/backup.tar.gz
+#   sudo ./server-restore-production-4.0.0.sh /path/to/backup.tar.gz
 #   Docker container:
 #   docker run --rm -it -v /path/to/backups:/backup:ro \
 #       -v /var/run/docker.sock:/var/run/docker.sock \
 #       ubuntu:24.04
-#   ./server-restore-production-3.1.0.sh \
+#   ./server-restore-production-4.0.0.sh \
 #       /backup/server-backup-YYYY-MM-DD_HHMMSS.tar.gz
 #
 # Debug:
-#   sudo DEBUG=1 ./server-restore-production-3.1.0.sh /path/to/backup.tar.gz
+#   sudo DEBUG=1 ./server-restore-production-4.0.0.sh /path/to/backup.tar.gz
 #
 # Optional environment:
 #   RESTORE_ROOT=/var/tmp/my-restore
 #   LOG_FILE=/var/log/server-restore.log
 #   KEEP_STAGING=1
+#   PLAN_ONLY=1             # verify archive/layout without modifying the system
+#   CHECKSUM_FILE=/path/to/archive.sha256
 #   PG_VERSION=18
 #   MONGO_VERSION=8.0
 #   MSSQL_PID=Developer
@@ -46,14 +48,16 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="3.1.0"
+VERSION="4.0.0"
 IN_CONTAINER=0
 CONTAINER_RUNTIME=""
 SYSTEMD_AVAILABLE=0
 DOCKER_SOCKET_AVAILABLE=0
-ARCHIVE="${1:-}"
+ARCHIVE="${1:-${BACKUP_ARCHIVE:-}}"
 DEBUG="${DEBUG:-0}"
 KEEP_STAGING="${KEEP_STAGING:-1}"
+PLAN_ONLY="${PLAN_ONLY:-0}"
+CHECKSUM_FILE="${CHECKSUM_FILE:-}"
 
 RESTORE_ROOT="${RESTORE_ROOT:-/var/tmp/server-restore-$(date +%Y%m%d_%H%M%S)}"
 LOG_FILE="${LOG_FILE:-/var/log/server-restore.log}"
@@ -81,6 +85,12 @@ ERRORS=0
 APT_DISABLED=()
 CLEANUP_DONE=0
 PG_STAGE=""
+ORIGINAL_ARCHIVE_ARG="${1:-}"
+
+# Runtime state
+DOCKER_CMD=""
+PG_SERVICE=""
+MONGO_SERVICE=""
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -143,17 +153,70 @@ have_cmd() {
 run_as() {
     local user="$1"
     shift
-    runuser -u "$user" -- "$@"
+    if have_cmd runuser; then
+        runuser -u "$user" -- "$@"
+    elif have_cmd su; then
+        su -s /bin/sh "$user" -c "$(printf '%q ' "$@")"
+    else
+        die "Neither runuser nor su is available; cannot run as $user."
+    fi
 }
 
+systemd_usable() {
+    (( SYSTEMD_AVAILABLE == 1 ))
+}
+
+unit_exists() {
+    local unit="$1"
+    systemd_usable || return 1
+    systemctl list-unit-files "$unit" >/dev/null 2>&1
+}
+
+service_active() {
+    local svc="$1"
+    systemd_usable || return 1
+    systemctl is-active --quiet "$svc"
+}
+
+service_start() {
+    local svc="$1"
+    if systemd_usable; then
+        systemctl enable "$svc" >/dev/null 2>&1 || true
+        systemctl start "$svc" || return 1
+        systemctl is-active --quiet "$svc"
+    else
+        warn "systemd is unavailable; cannot start service unit '$svc' directly."
+        return 1
+    fi
+}
+
+service_restart() {
+    local svc="$1"
+    if systemd_usable; then
+        systemctl restart "$svc" || return 1
+        systemctl is-active --quiet "$svc"
+    else
+        warn "systemd is unavailable; cannot restart service unit '$svc'."
+        return 1
+    fi
+}
+
+require_root() {
+    [[ "$EUID" -eq 0 ]] || die "Run this script as root."
+}
+
+# Ensure Docker CLI is selected from either normal PATH or common locations.
 detect_container() {
     IN_CONTAINER=0
     CONTAINER_RUNTIME=""
+    SYSTEMD_AVAILABLE=0
+    DOCKER_SOCKET_AVAILABLE=0
 
     if [[ -f /.dockerenv ]]; then
         IN_CONTAINER=1
         CONTAINER_RUNTIME="docker"
-    elif grep -qaE '(^|/)(docker|containerd|kubepods|podman)(/|$)' /proc/1/cgroup 2>/dev/null; then
+    elif [[ -r /proc/1/cgroup ]] &&
+         grep -qaE '(docker|containerd|kubepods|podman|libpod)' /proc/1/cgroup 2>/dev/null; then
         IN_CONTAINER=1
         CONTAINER_RUNTIME="container-runtime"
     elif [[ -r /proc/1/environ ]] &&
@@ -163,138 +226,31 @@ detect_container() {
     fi
 
     if have_cmd systemctl && [[ -d /run/systemd/system ]] &&
-       systemctl list-units >/dev/null 2>&1; then
+       systemctl list-units --no-pager >/dev/null 2>&1; then
         SYSTEMD_AVAILABLE=1
-    else
-        SYSTEMD_AVAILABLE=0
     fi
 
     if [[ -S /var/run/docker.sock || -S /run/docker.sock ]]; then
         DOCKER_SOCKET_AVAILABLE=1
-    else
-        DOCKER_SOCKET_AVAILABLE=0
     fi
 
     if (( IN_CONTAINER )); then
         log "Container environment detected: ${CONTAINER_RUNTIME:-unknown}"
-        log "systemd available: $SYSTEMD_AVAILABLE"
-        log "Docker socket mounted: $DOCKER_SOCKET_AVAILABLE"
     else
         log "Host environment detected."
     fi
+    log "systemd available: $SYSTEMD_AVAILABLE"
+    log "Docker socket available: $DOCKER_SOCKET_AVAILABLE"
 }
 
-unit_exists() {
-    (( SYSTEMD_AVAILABLE == 1 )) || return 1
-    systemctl list-unit-files "$1" >/dev/null 2>&1
-}
-
-service_start() {
-    local svc="$1"
-
-    if (( SYSTEMD_AVAILABLE == 1 )); then
-        systemctl enable "$svc" >/dev/null 2>&1 || true
-        systemctl start "$svc"
-        systemctl is-active --quiet "$svc" || die "Service is not active: $svc"
-        return
-    fi
-
-    # Docker/container mode: start common daemons directly when possible.
-    case "$svc" in
-        nginx)
-            nginx -t || die "Nginx configuration validation failed."
-            nginx >/dev/null 2>&1 || true
-            sleep 1
-            pgrep -x nginx >/dev/null 2>&1 ||
-                die "Nginx process did not start in container mode."
-            ;;
-        postgresql)
-            if have_cmd pg_ctlcluster && have_cmd pg_lsclusters; then
-                local cluster
-                cluster="$(pg_lsclusters --no-header 2>/dev/null | awk '$4=="down"{print $1 ":" $2; exit}')"
-                if [[ -n "$cluster" ]]; then
-                    pg_ctlcluster "${cluster%%:*}" "${cluster#*:}" start
-                else
-                    cluster="$(pg_lsclusters --no-header 2>/dev/null | awk 'NR==1{print $1 ":" $2}')"
-                    [[ -n "$cluster" ]] || die "No PostgreSQL cluster found in container."
-                    pg_ctlcluster "${cluster%%:*}" "${cluster#*:}" start || true
-                fi
-            elif have_cmd pg_ctl; then
-                die "PostgreSQL cluster is not initialized; cannot start it automatically."
-            else
-                die "No PostgreSQL container start method found."
-            fi
-            ;;
-        mongod|mongodb)
-            if pgrep -x mongod >/dev/null 2>&1; then
-                return
-            fi
-            local conf="/etc/mongod.conf"
-            [[ -f "$conf" ]] || conf="/etc/mongodb.conf"
-            if [[ -f "$conf" ]] && have_cmd mongod; then
-                mongod --config "$conf" --fork >/dev/null 2>&1 || true
-            elif have_cmd mongod; then
-                mongod --dbpath /var/lib/mongodb --fork >/dev/null 2>&1 || true
-            else
-                die "mongod executable not found."
-            fi
-            sleep 2
-            pgrep -x mongod >/dev/null 2>&1 ||
-                die "MongoDB process did not start in container mode."
-            ;;
-        docker)
-            (( DOCKER_SOCKET_AVAILABLE == 1 )) ||
-                die "Docker daemon/socket is unavailable in container mode."
-            ;;
-        crowdsec)
-            warn "CrowdSec service management skipped: systemd is unavailable."
-            ;;
-        mssql-server)
-            if pgrep -f '/opt/mssql/bin/sqlservr' >/dev/null 2>&1; then
-                return
-            fi
-            [[ -x /opt/mssql/bin/sqlservr ]] ||
-                die "SQL Server executable not found."
-            log "MSSQL: starting sqlservr directly because systemd is unavailable."
-            nohup /opt/mssql/bin/sqlservr >/var/log/mssql-container.log 2>&1 &
-            sleep 5
-            pgrep -f '/opt/mssql/bin/sqlservr' >/dev/null 2>&1 ||
-                die "SQL Server process did not start in container mode."
-            ;;
-        *)
-            warn "Cannot start service '$svc': systemd is unavailable."
-            ;;
-    esac
-}
-
-service_restart() {
-    local svc="$1"
-    if (( SYSTEMD_AVAILABLE == 1 )); then
-        systemctl restart "$svc"
-        systemctl is-active --quiet "$svc" || die "Service failed after restart: $svc"
+resolve_docker_cli() {
+    if have_cmd docker; then
+        DOCKER_CMD="$(command -v docker)"
+    elif [[ -x /usr/bin/docker ]]; then
+        DOCKER_CMD=/usr/bin/docker
     else
-        case "$svc" in
-            nginx)
-                nginx -s reload >/dev/null 2>&1 || service_start nginx
-                ;;
-            postgresql)
-                service_start postgresql
-                ;;
-            mongod|mongodb)
-                service_start "$svc"
-                ;;
-            mssql-server)
-                service_start mssql-server
-                ;;
-            *)
-                service_start "$svc"
-                ;;
-        esac
+        DOCKER_CMD=""
     fi
-}
-
-require_root() {
-    [[ "$EUID" -eq 0 ]] || die "Run this script as root."
 }
 
 detect_os() {
@@ -374,13 +330,66 @@ verify_file() {
 # Archive verification / extraction
 # ---------------------------------------------------------------------------
 
+verify_sha256() {
+    local archive="$1"
+    local checksum="$2"
+    local expected actual checksum_line
+
+    [[ -f "$archive" ]] || die "Backup archive does not exist: $archive"
+    [[ -r "$archive" ]] || die "Backup archive is not readable: $archive"
+    [[ -s "$archive" ]] || die "Backup archive is empty: $archive"
+    [[ -f "$checksum" ]] || die "SHA-256 file does not exist: $checksum"
+    [[ -r "$checksum" ]] || die "SHA-256 file is not readable: $checksum"
+
+    checksum_line="$(awk '
+        {
+            x=$1
+            if (length(x)==64 && x ~ /^[0-9A-Fa-f]+$/) { print; exit }
+        }
+    ' "$checksum")"
+    expected="$(printf '%s\n' "$checksum_line" | awk '{print $1}')"
+
+    [[ "$expected" =~ ^[0-9A-Fa-f]{64}$ ]] ||
+        die "Invalid SHA-256 file format: $checksum"
+
+    # Do NOT use `sha256sum -c` here. Detached checksum files often contain
+    # the original absolute path, which becomes stale after a backup is moved,
+    # copied, or mounted into a Docker container.
+    actual="$(sha256sum "$archive" | awk '{print $1}')"
+
+    log "Expected SHA-256: $expected"
+    log "Actual SHA-256:   $actual"
+
+    [[ "${expected,,}" == "${actual,,}" ]] ||
+        die "SHA-256 verification failed."
+
+    log "SHA-256: OK"
+}
+
+validate_tar_paths() {
+    local archive="$1"
+    local bad
+
+    bad="$(tar -tzf "$archive" | awk '
+        index($0, "\0") {next}
+        $0 ~ /^\// || $0 ~ /(^|\/)\.\.($|\/)/ {print; exit}
+    ')"
+    [[ -z "$bad" ]] || die "Unsafe path found in archive: $bad"
+}
+
 verify_archive() {
-    local checksum="${ARCHIVE}.sha256"
+    local checksum="${CHECKSUM_FILE:-${ARCHIVE}.sha256}"
 
     need_cmd gzip
     need_cmd tar
     need_cmd sha256sum
 
+    [[ -f "$ARCHIVE" ]] || die "Backup archive does not exist: $ARCHIVE"
+    [[ -r "$ARCHIVE" ]] || die "Backup archive is not readable: $ARCHIVE"
+    [[ -s "$ARCHIVE" ]] || die "Backup archive is empty: $ARCHIVE"
+
+    log "Archive: $ARCHIVE"
+    log "Checksum: $checksum"
     log "Checking gzip integrity..."
     gzip -t "$ARCHIVE" || die "gzip integrity check failed."
     log "gzip integrity: OK"
@@ -389,13 +398,13 @@ verify_archive() {
     tar -tzf "$ARCHIVE" >/dev/null || die "tar archive is corrupt."
     log "tar structure: OK"
 
+    log "Checking archive paths..."
+    validate_tar_paths "$ARCHIVE"
+    log "Archive paths: OK"
+
     if [[ -f "$checksum" ]]; then
         log "Checking detached SHA-256..."
-        (
-            cd "$(dirname "$ARCHIVE")"
-            sha256sum --strict --check "$(basename "$checksum")"
-        ) || die "SHA-256 verification failed."
-        log "SHA-256: OK"
+        verify_sha256 "$ARCHIVE" "$checksum"
     else
         warn "Detached checksum not found: $checksum"
         if [[ -t 0 ]]; then
@@ -412,9 +421,11 @@ extract_archive() {
     verify_archive
 
     safe_mkdir "$RESTORE_ROOT" 0700
+    chmod 700 "$RESTORE_ROOT"
     log "Extracting archive to: $RESTORE_ROOT"
 
     tar --acls --xattrs --numeric-owner \
+        --no-same-owner \
         -xzf "$ARCHIVE" -C "$RESTORE_ROOT" ||
         die "Archive extraction failed."
 
@@ -455,30 +466,30 @@ show_backup_layout() {
 }
 
 validate_selected_backup() {
-    [[ "$RESTORE_WWW" == 1 ]] && {
+    if [[ "$RESTORE_WWW" == 1 ]]; then
         [[ -f "$TREE/WWW/var-www.tar.gz" ]] ||
             warn "/var/www selected but backup file is absent."
-    }
+    fi
 
-    [[ "$RESTORE_NGINX" == 1 ]] && {
+    if [[ "$RESTORE_NGINX" == 1 ]]; then
         [[ -d "$TREE/NGINX/etc-nginx" ]] ||
             warn "Nginx selected but NGINX/etc-nginx is absent."
-    }
+    fi
 
-    [[ "$RESTORE_POSTGRES" == 1 ]] && {
+    if [[ "$RESTORE_POSTGRES" == 1 ]]; then
         [[ -d "$TREE/POSTGRES" ]] ||
             warn "PostgreSQL selected but POSTGRES directory is absent."
-    }
+    fi
 
-    [[ "$RESTORE_MONGO" == 1 ]] && {
+    if [[ "$RESTORE_MONGO" == 1 ]]; then
         [[ -f "$TREE/MONGODB/mongodb.archive.gz" ]] ||
             warn "MongoDB selected but mongodb.archive.gz is absent."
-    }
+    fi
 
-    [[ "$RESTORE_MSSQL" == 1 ]] && {
+    if [[ "$RESTORE_MSSQL" == 1 ]]; then
         [[ -d "$TREE/MSSQL/bak" ]] ||
             warn "MSSQL selected but MSSQL/bak is absent."
-    }
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -487,16 +498,21 @@ validate_selected_backup() {
 
 apt_disable_conflicting_sources() {
     local f backup
-
     [[ "$PACKAGE_MANAGER" == "apt" ]] || return 0
 
-    # Only disable Microsoft sources while installing packages when MSSQL is
-    # NOT selected. Never touch backup .restore-disabled files.
-    [[ "$RESTORE_MSSQL" == 1 ]] && return 0
-
+    # Any pre-existing Microsoft source can break apt-get update before the
+    # restore script gets a chance to install the correct MSSQL repository.
+    # Keep the original as *.restore-disabled and restore it only if the script
+    # did not create a canonical replacement with the same path.
     while IFS= read -r -d '' f; do
         if grep -qiE 'packages\.microsoft\.com' "$f" 2>/dev/null; then
+            case "$f" in
+                *.restore-disabled|*.restore-disabled.*) continue ;;
+            esac
             backup="${f}.restore-disabled"
+            if [[ -e "$backup" ]]; then
+                backup="${f}.restore-disabled.$(date +%s)"
+            fi
             mv -f -- "$f" "$backup"
             APT_DISABLED+=("$backup")
             log "Temporarily disabled Microsoft source: $f"
@@ -506,9 +522,7 @@ apt_disable_conflicting_sources() {
             [[ -f /etc/apt/sources.list ]] && printf '%s\0' /etc/apt/sources.list
             find /etc/apt/sources.list.d -maxdepth 1 -type f \
                 \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null || true
-        } | while IFS= read -r -d '' f; do
-            printf '%s\0' "$f"
-        done
+        }
     )
 }
 
@@ -517,7 +531,29 @@ apt_restore_sources() {
     for f in "${APT_DISABLED[@]:-}"; do
         [[ -f "$f" ]] || continue
         original="${f%.restore-disabled}"
-        [[ -e "$original" ]] && rm -f -- "$original"
+        # Timestamped backups have a different suffix.
+        if [[ "$original" == "$f" ]]; then
+            original="${f%%.restore-disabled.*}"
+        fi
+        if [[ -e "$original" ]]; then
+            warn "Not restoring disabled APT source because replacement exists: $original"
+            continue
+        fi
+
+        local microsoft_current=0
+        while IFS= read -r -d '' current; do
+            if grep -qiE 'packages\.microsoft\.com' "$current" 2>/dev/null; then
+                microsoft_current=1
+                break
+            fi
+        done < <(find /etc/apt/sources.list.d -maxdepth 1 -type f \
+            \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null || true)
+
+        if (( microsoft_current == 1 )); then
+            log "Keeping disabled legacy Microsoft source disabled because an active Microsoft repository exists."
+            continue
+        fi
+
         mv -f -- "$f" "$original" || warn "Could not restore APT source: $original"
     done
     APT_DISABLED=()
@@ -551,11 +587,17 @@ install_postgres_ubuntu_official() {
 
     chmod 0644 "$key"
 
+    local pg_arch
+    case "$ARCH" in
+        amd64|arm64) pg_arch="$ARCH" ;;
+        *) die "Unsupported PostgreSQL PGDG architecture: $ARCH" ;;
+    esac
+
     cat > "$repo" <<EOF
-Types: deb deb-src
+Types: deb
 URIs: https://apt.postgresql.org/pub/repos/apt
 Suites: ${OS_CODENAME}-pgdg
-Architectures: amd64 arm64
+Architectures: ${pg_arch}
 Components: main
 Signed-By: ${key}
 EOF
@@ -608,8 +650,15 @@ install_mongodb_ubuntu_official() {
 
     chmod 0644 "$key"
 
+    local mongo_arch
+    case "$ARCH" in
+        amd64) mongo_arch=amd64 ;;
+        arm64) mongo_arch=arm64 ;;
+        *) die "Unsupported MongoDB architecture: $ARCH" ;;
+    esac
+
     cat > "$list" <<EOF
-deb [ arch=amd64,arm64 signed-by=${key} ] https://repo.mongodb.org/apt/ubuntu ${OS_CODENAME}/mongodb-org/8.0 multiverse
+deb [ arch=${mongo_arch} signed-by=${key} ] https://repo.mongodb.org/apt/ubuntu ${OS_CODENAME}/mongodb-org/8.0 multiverse
 EOF
 
     chmod 0644 "$list"
@@ -716,17 +765,21 @@ install_selected_packages() {
             apt_disable_conflicting_sources
             install_base_tools_apt
 
-            [[ "$RESTORE_NGINX" == 1 ]] &&
+            if [[ "$RESTORE_NGINX" == 1 ]]; then
                 apt-get install -y nginx
+            fi
 
-            [[ "$RESTORE_POSTGRES" == 1 ]] &&
+            if [[ "$RESTORE_POSTGRES" == 1 ]]; then
                 install_postgres
+            fi
 
-            [[ "$RESTORE_MONGO" == 1 ]] &&
+            if [[ "$RESTORE_MONGO" == 1 ]]; then
                 install_mongodb
+            fi
 
-            [[ "$RESTORE_MSSQL" == 1 ]] &&
+            if [[ "$RESTORE_MSSQL" == 1 ]]; then
                 install_mssql
+            fi
 
             if [[ "$RESTORE_DOCKER" == 1 ]]; then
                 if (( IN_CONTAINER == 1 && DOCKER_SOCKET_AVAILABLE == 0 )); then
@@ -736,27 +789,33 @@ install_selected_packages() {
                 fi
             fi
 
-            [[ "$RESTORE_SSH" == 1 ]] &&
+            if [[ "$RESTORE_SSH" == 1 ]]; then
                 apt-get install -y openssh-server
+            fi
 
-            [[ "$RESTORE_FIREWALL" == 1 ]] &&
+            if [[ "$RESTORE_FIREWALL" == 1 ]]; then
                 apt-get install -y ufw iptables nftables
+            fi
             ;;
         pacman)
             pacman -Sy --noconfirm --needed \
                 ca-certificates curl tar gzip rsync
 
-            [[ "$RESTORE_NGINX" == 1 ]] &&
+            if [[ "$RESTORE_NGINX" == 1 ]]; then
                 pacman -S --noconfirm --needed nginx
+            fi
 
-            [[ "$RESTORE_POSTGRES" == 1 ]] &&
+            if [[ "$RESTORE_POSTGRES" == 1 ]]; then
                 install_postgres
+            fi
 
-            [[ "$RESTORE_MONGO" == 1 ]] &&
+            if [[ "$RESTORE_MONGO" == 1 ]]; then
                 install_mongodb
+            fi
 
-            [[ "$RESTORE_MSSQL" == 1 ]] &&
+            if [[ "$RESTORE_MSSQL" == 1 ]]; then
                 die "Microsoft SQL Server Linux is not installed from Arch official repositories. Use a supported Ubuntu host/package for automatic MSSQL recovery."
+            fi
 
             if [[ "$RESTORE_DOCKER" == 1 ]]; then
                 if (( IN_CONTAINER == 1 && DOCKER_SOCKET_AVAILABLE == 0 )); then
@@ -766,8 +825,9 @@ install_selected_packages() {
                 fi
             fi
 
-            [[ "$RESTORE_SSH" == 1 ]] &&
+            if [[ "$RESTORE_SSH" == 1 ]]; then
                 pacman -S --noconfirm --needed openssh
+            fi
             ;;
     esac
 
@@ -805,8 +865,10 @@ restore_www() {
             die "Could not move existing /var/www to $old"
     fi
 
-    mv "$stage/var/www" /var/www ||
-        die "Could not activate restored /var/www."
+    mv "$stage/var/www" /var/www || {
+        [[ -e "$old" ]] && mv "$old" /var/www || true
+        die "Could not activate restored /var/www; previous /var/www was restored."
+    }
 
     log "/var/www restored. Previous copy: $old"
 }
@@ -896,8 +958,10 @@ restore_nginx() {
 
     restore_copy "$TREE/NGINX/etc-nginx" "$stage"
 
-    if (( SYSTEMD_AVAILABLE == 1 )); then
+    if systemd_usable; then
         systemctl stop nginx 2>/dev/null || true
+    else
+        pkill -TERM -x nginx 2>/dev/null || true
     fi
 
     if [[ -e /etc/nginx ]]; then
@@ -914,7 +978,7 @@ restore_nginx() {
         log "Nginx validation failed. Rolling back."
         rm -rf /etc/nginx
         [[ -d "$old" ]] && mv "$old" /etc/nginx
-        if (( SYSTEMD_AVAILABLE == 1 )); then
+        if systemd_usable; then
             systemctl start nginx 2>/dev/null || true
         else
             nginx >/dev/null 2>&1 || true
@@ -922,7 +986,11 @@ restore_nginx() {
         die "Nginx restore failed; previous configuration restored."
     fi
 
-    service_start nginx
+    if systemd_usable; then
+        service_start nginx || die "Nginx failed to start after successful configuration validation."
+    else
+        nginx >/dev/null 2>&1 || die "Nginx failed to start in systemd-less environment."
+    fi
 
     log "Nginx restored and running. Previous copy: $old"
 }
@@ -934,12 +1002,12 @@ restore_nginx() {
 restore_systemd() {
     [[ "$RESTORE_SYSTEMD" == 1 ]] || return 0
 
-    if (( SYSTEMD_AVAILABLE == 0 )); then
-        warn "Skipping systemd unit restore: systemd is not available in this environment."
+    log "[4/11] Restoring systemd units"
+
+    if ! systemd_usable; then
+        warn "systemd is not available in this environment; systemd unit restore is skipped."
         return 0
     fi
-
-    log "[4/11] Restoring systemd units"
 
     if [[ -d "$TREE/SYSTEMD/etc-systemd-system" ]]; then
         restore_copy \
@@ -968,7 +1036,9 @@ restore_crowdsec() {
 
     local old="/etc/crowdsec.before-restore-$(date +%Y%m%d_%H%M%S)"
 
-    systemctl stop crowdsec 2>/dev/null || true
+    if systemd_usable; then
+        systemctl stop crowdsec 2>/dev/null || true
+    fi
 
     if [[ -e /etc/crowdsec ]]; then
         mv /etc/crowdsec "$old"
@@ -977,9 +1047,11 @@ restore_crowdsec() {
     restore_copy "$TREE/CROWDSEC/etc-crowdsec" /etc/crowdsec
     chown -R root:root /etc/crowdsec
 
-    if unit_exists crowdsec.service; then
+    if systemd_usable && unit_exists crowdsec.service; then
         systemctl enable crowdsec >/dev/null 2>&1 || true
         systemctl start crowdsec || warn "CrowdSec did not start. Previous config: $old"
+    else
+        warn "CrowdSec service start skipped because systemd is unavailable or unit is missing."
     fi
 }
 
@@ -1022,11 +1094,15 @@ pg_prepare_globals() {
     while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ "$line" =~ $create_role_re ]]; then
             decl="${BASH_REMATCH[1]}"
-            role_name="$decl"
-
-            if [[ "$role_name" == \"*\" ]]; then
-                role_name="${role_name:1:${#role_name}-2}"
-                role_name="${role_name//\"\"/\"}"
+            # globals.sql normally contains `CREATE ROLE <name> ...`.
+            # Extract only the role identifier; do not treat WITH attributes as
+            # part of the role name.
+            if [[ "${decl:0:1}" == '"' ]]; then
+                role_name="$(printf '%s\n' "$decl" | sed -E 's/^"((""|[^"])*)".*/\1/')"
+                role_name="$(printf '%s\n' "$role_name" | sed 's/""/"/g')"
+            else
+                role_name="${decl%%[[:space:]]*}"
+                role_name="${role_name%;}"
             fi
 
             if [[ -n "${existing[$role_name]+yes}" ]]; then
@@ -1074,6 +1150,39 @@ pg_drop_create_database() {
         die "Could not create PostgreSQL database: $db"
 }
 
+start_postgres() {
+    if systemd_usable && unit_exists postgresql.service; then
+        service_start postgresql && return 0
+    fi
+
+    if have_cmd pg_lsclusters && have_cmd pg_ctlcluster; then
+        local line version cluster status
+        while read -r version cluster status _; do
+            [[ -n "$version" && -n "$cluster" ]] || continue
+            if [[ "$status" != "online" ]]; then
+                log "PostgreSQL: starting cluster $version/$cluster without systemd."
+                pg_ctlcluster "$version" "$cluster" start || true
+            fi
+            if pg_ctlcluster "$version" "$cluster" status >/dev/null 2>&1; then
+                PG_SERVICE="${version}/${cluster}"
+                return 0
+            fi
+        done < <(pg_lsclusters --no-header 2>/dev/null || true)
+    fi
+
+    # Fallback for images where the cluster exists but pg_lsclusters is absent.
+    if have_cmd pg_ctl; then
+        local datadir
+        datadir="$(find /var/lib/postgresql -mindepth 2 -maxdepth 2 -type f -name PG_VERSION -printf '%h\n' 2>/dev/null | head -n1 || true)"
+        if [[ -n "$datadir" ]]; then
+            run_as postgres pg_ctl -D "$datadir" -w start || true
+            run_as postgres pg_ctl -D "$datadir" status >/dev/null 2>&1 && return 0
+        fi
+    fi
+
+    die "PostgreSQL could not be started (systemd unavailable and no usable cluster start method found)."
+}
+
 restore_postgres() {
     [[ "$RESTORE_POSTGRES" == 1 ]] || return 0
     [[ -d "$TREE/POSTGRES" ]] || {
@@ -1088,7 +1197,7 @@ restore_postgres() {
     id postgres >/dev/null 2>&1 ||
         die "PostgreSQL OS user does not exist."
 
-    service_start postgresql
+    start_postgres
 
     PG_STAGE="/var/tmp/server-restore-postgresql-$(date +%Y%m%d_%H%M%S)-$$"
     local pg_stage="$PG_STAGE"
@@ -1171,6 +1280,35 @@ restore_postgres() {
 # MongoDB
 # ---------------------------------------------------------------------------
 
+start_mongo() {
+    if systemd_usable; then
+        if unit_exists mongod.service && service_start mongod; then
+            MONGO_SERVICE=mongod
+            return 0
+        fi
+        if unit_exists mongodb.service && service_start mongodb; then
+            MONGO_SERVICE=mongodb
+            return 0
+        fi
+    fi
+
+    if have_cmd mongod; then
+        local cfg="${MONGO_CONFIG:-/etc/mongod.conf}"
+        local pidfile="/var/run/mongodb/mongod.pid"
+        if [[ -f "$cfg" ]]; then
+            install -d -o mongodb -g mongodb -m 0755 /var/run/mongodb /var/log/mongodb 2>/dev/null || true
+            if ! pgrep -x mongod >/dev/null 2>&1; then
+                log "MongoDB: starting mongod without systemd."
+                run_as mongodb mongod --config "$cfg" --fork --pidfilepath "$pidfile" || true
+            fi
+            sleep 2
+            pgrep -x mongod >/dev/null 2>&1 && return 0
+        fi
+    fi
+
+    die "MongoDB could not be started (no working systemd unit or mongod direct-start configuration)."
+}
+
 restore_mongo() {
     [[ "$RESTORE_MONGO" == 1 ]] || return 0
     [[ -f "$TREE/MONGODB/mongodb.archive.gz" ]] || {
@@ -1182,17 +1320,7 @@ restore_mongo() {
 
     need_cmd mongorestore
 
-    local service=""
-    if unit_exists mongod.service; then
-        service="mongod"
-    elif unit_exists mongodb.service; then
-        service="mongodb"
-    fi
-
-    [[ -n "$service" ]] ||
-        die "MongoDB service unit not found after installation."
-
-    service_start "$service"
+    start_mongo
 
     local stage="$RESTORE_ROOT/stage/mongodb"
     rm -rf "$stage"
@@ -1311,9 +1439,18 @@ mssql_setup_if_needed() {
         /opt/mssql/bin/mssql-conf -n setup ||
         die "MSSQL first-time setup failed."
 
-    systemctl enable mssql-server >/dev/null 2>&1 || true
-    systemctl restart mssql-server ||
-        die "MSSQL service failed after setup."
+    if systemd_usable; then
+        systemctl enable mssql-server >/dev/null 2>&1 || true
+        systemctl restart mssql-server || die "MSSQL service failed after setup."
+    else
+        log "MSSQL: systemd unavailable; starting sqlservr directly."
+        if ! pgrep -f '/opt/mssql/bin/sqlservr' >/dev/null 2>&1; then
+            runuser -u mssql -- /opt/mssql/bin/sqlservr >/var/opt/mssql/sqlservr.restore.log 2>&1 &
+            sleep 8
+        fi
+        pgrep -f '/opt/mssql/bin/sqlservr' >/dev/null 2>&1 ||
+            die "MSSQL sqlservr process failed to start."
+    fi
 }
 
 mssql_sqlcmd() {
@@ -1338,7 +1475,12 @@ restore_mssql() {
 
     get_mssql_password
 
-    service_start mssql-server
+    if systemd_usable; then
+        service_start mssql-server || die "MSSQL service failed to start."
+    elif ! pgrep -f '/opt/mssql/bin/sqlservr' >/dev/null 2>&1; then
+        runuser -u mssql -- /opt/mssql/bin/sqlservr >/var/opt/mssql/sqlservr.restore.log 2>&1 &
+        sleep 8
+    fi
 
     local stage="/var/opt/mssql/restore-staging"
     safe_mkdir "$stage" 0750
@@ -1475,57 +1617,72 @@ restore_docker() {
     [[ "$RESTORE_DOCKER" == 1 ]] || return 0
     [[ -d "$TREE/DOCKER/volumes" ]] || {
         warn "Docker volume backup not present."
-        return
+        return 0
     }
 
     log "[9/11] Restoring Docker volumes"
 
+    resolve_docker_cli
+    if [[ -z "$DOCKER_CMD" ]]; then
+        if (( IN_CONTAINER )); then
+            warn "Docker CLI is unavailable inside this container; Docker volume restore skipped."
+            return 0
+        fi
+        die "Docker command not available."
+    fi
+
     if (( IN_CONTAINER == 1 && DOCKER_SOCKET_AVAILABLE == 0 )); then
         warn "Docker container detected but no Docker socket is mounted."
-        warn "Docker volume restore is skipped. Mount /var/run/docker.sock to restore host Docker volumes."
+        warn "Docker volume restore skipped. Mount /var/run/docker.sock to restore host Docker volumes."
         return 0
     fi
 
-    have_cmd docker || die "Docker command not available."
-
     if (( DOCKER_SOCKET_AVAILABLE == 0 )); then
-        service_start docker
+        if systemd_usable; then
+            service_start docker || die "Docker service could not be started."
+        elif have_cmd dockerd; then
+            die "Docker daemon is not running and systemd is unavailable. Start dockerd externally or mount docker.sock."
+        else
+            die "Docker daemon is unavailable."
+        fi
     else
         log "Using mounted Docker socket; Docker daemon belongs to the host."
     fi
 
-    docker info >/dev/null 2>&1 ||
-        die "Docker daemon is not reachable."
+    "$DOCKER_CMD" info >/dev/null 2>&1 || die "Docker daemon is not reachable."
 
     local archive vol mountpoint
     while IFS= read -r -d '' archive; do
         vol="$(basename "$archive" .tar.gz)"
+        [[ "$vol" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "Unsafe Docker volume name: $vol"
 
-        docker volume inspect "$vol" >/dev/null 2>&1 ||
-            docker volume create "$vol" >/dev/null
+        "$DOCKER_CMD" volume inspect "$vol" >/dev/null 2>&1 ||
+            "$DOCKER_CMD" volume create "$vol" >/dev/null
 
-        mountpoint="$(docker volume inspect \
-            --format '{{.Mountpoint}}' "$vol")"
-
+        mountpoint="$("$DOCKER_CMD" volume inspect --format '{{.Mountpoint}}' "$vol")"
         [[ -n "$mountpoint" && -d "$mountpoint" ]] ||
             die "Docker volume mountpoint unavailable: $vol"
 
         log "Docker: restoring volume $vol"
 
-        find "$mountpoint" -mindepth 1 -maxdepth 1 \
-            -exec rm -rf -- {} +
+        # Extract into a sibling temporary directory first. This avoids leaving
+        # a half-restored volume when tar extraction fails.
+        local tmp="${mountpoint}.restore-$$"
+        rm -rf -- "$tmp"
+        install -d -m 0700 "$tmp"
+        tar --acls --xattrs --numeric-owner --no-same-owner \
+            -xzf "$archive" -C "$tmp" || {
+                rm -rf -- "$tmp"
+                die "Docker volume restore failed during extraction: $vol"
+            }
 
-        tar --acls --xattrs --numeric-owner \
-            -xzf "$archive" -C "$mountpoint" ||
-            die "Docker volume restore failed: $vol"
+        find "$mountpoint" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+        find "$tmp" -mindepth 1 -maxdepth 1 -exec mv -- {} "$mountpoint"/ \;
+        rm -rf -- "$tmp"
     done < <(find "$TREE/DOCKER/volumes" -type f -name '*.tar.gz' -print0)
 
     log "Docker volumes restored."
 }
-
-# ---------------------------------------------------------------------------
-# Firewall / SSH
-# ---------------------------------------------------------------------------
 
 restore_firewall() {
     [[ "$RESTORE_FIREWALL" == 1 ]] || return 0
@@ -1571,17 +1728,22 @@ restore_ssh() {
     chmod 755 /etc/ssh
 
     if sshd -t; then
-        systemctl reload ssh 2>/dev/null ||
-            systemctl reload sshd 2>/dev/null ||
-            warn "SSH configuration valid but reload failed."
+        if systemd_usable; then
+            systemctl reload ssh 2>/dev/null ||
+                systemctl reload sshd 2>/dev/null ||
+                warn "SSH configuration valid but reload failed."
+        else
+            warn "SSH configuration is valid; service reload skipped because systemd is unavailable."
+        fi
     else
         log "SSH validation failed. Rolling back."
         rm -rf /etc/ssh
         mv "$old" /etc/ssh
         sshd -t || true
-        systemctl reload ssh 2>/dev/null ||
-            systemctl reload sshd 2>/dev/null ||
-            true
+        if systemd_usable; then
+            systemctl reload ssh 2>/dev/null ||
+                systemctl reload sshd 2>/dev/null || true
+        fi
         die "SSH restore failed; previous SSH configuration restored."
     fi
 }
@@ -1593,63 +1755,45 @@ restore_ssh() {
 final_verify() {
     log "Running final service verification."
 
-    if [[ "$RESTORE_NGINX" == 1 ]]; then
+    if [[ "$RESTORE_NGINX" == 1 ]] && have_cmd nginx; then
         nginx -t || die "Final Nginx verification failed."
-        if (( SYSTEMD_AVAILABLE == 1 )); then
-            systemctl is-active --quiet nginx ||
-                die "Final Nginx service verification failed."
+        if systemd_usable; then
+            systemctl is-active --quiet nginx || die "Final Nginx service verification failed."
         else
-            pgrep -x nginx >/dev/null 2>&1 ||
-                die "Final Nginx process verification failed in container mode."
+            pgrep -x nginx >/dev/null 2>&1 || warn "Nginx configuration is valid but nginx process is not running (no systemd)."
         fi
     fi
 
     if [[ "$RESTORE_POSTGRES" == 1 ]]; then
-        if (( SYSTEMD_AVAILABLE == 1 )); then
-            systemctl is-active --quiet postgresql ||
-                die "Final PostgreSQL service verification failed."
-        fi
         run_as postgres psql -Atqc "SELECT version();" >/dev/null ||
             die "Final PostgreSQL query verification failed."
     fi
 
     if [[ "$RESTORE_MONGO" == 1 ]]; then
-        if (( SYSTEMD_AVAILABLE == 1 )); then
-            if unit_exists mongod.service; then
-                systemctl is-active --quiet mongod ||
-                    die "Final MongoDB service verification failed."
-            elif unit_exists mongodb.service; then
-                systemctl is-active --quiet mongodb ||
-                    die "Final MongoDB service verification failed."
-            fi
-        elif have_cmd mongosh; then
-            local verify_uri="${MONGO_URI:-mongodb://127.0.0.1:27017}"
-            mongosh "$verify_uri" --quiet --eval 'db.adminCommand({ping:1}).ok' |
-                grep -qx '1' ||
-                die "Final MongoDB ping verification failed."
-        else
-            pgrep -x mongod >/dev/null 2>&1 ||
-                die "Final MongoDB process verification failed in container mode."
+        local uri="${MONGO_URI:-mongodb://127.0.0.1:27017}"
+        if have_cmd mongosh; then
+            mongosh "$uri" --quiet --eval 'db.adminCommand({ping:1}).ok' |
+                grep -qx '1' || die "Final MongoDB ping verification failed."
+        elif ! pgrep -x mongod >/dev/null 2>&1 && ! systemd_usable; then
+            warn "MongoDB client verification unavailable."
         fi
     fi
 
     if [[ "$RESTORE_MSSQL" == 1 ]]; then
-        if (( SYSTEMD_AVAILABLE == 1 )); then
-            systemctl is-active --quiet mssql-server ||
-                die "Final MSSQL service verification failed."
+        if systemd_usable; then
+            systemctl is-active --quiet mssql-server || die "Final MSSQL service verification failed."
+        elif pgrep -f '/opt/mssql/bin/sqlservr' >/dev/null 2>&1; then
+            log "MSSQL process verification: OK"
         else
-            pgrep -f '/opt/mssql/bin/sqlservr' >/dev/null 2>&1 ||
-                die "Final MSSQL process verification failed in container mode."
+            warn "MSSQL service verification skipped because systemd is unavailable."
         fi
     fi
 
-    if [[ "$RESTORE_DOCKER" == 1 ]]; then
-        if (( IN_CONTAINER == 1 && DOCKER_SOCKET_AVAILABLE == 0 )); then
-            warn "Final Docker verification skipped: no Docker socket is mounted."
+    if [[ "$RESTORE_DOCKER" == 1 && -n "$DOCKER_CMD" ]]; then
+        if "$DOCKER_CMD" info >/dev/null 2>&1; then
+            log "Docker daemon verification: OK"
         else
-            have_cmd docker || die "Final Docker verification failed: docker CLI missing."
-            docker info >/dev/null 2>&1 ||
-                die "Final Docker verification failed: daemon unreachable."
+            warn "Docker daemon is not reachable during final verification."
         fi
     fi
 
@@ -1696,16 +1840,39 @@ main() {
     [[ -n "$ARCHIVE" ]] ||
         die "Usage: $0 /path/to/server-backup.tar.gz"
 
-    [[ -f "$ARCHIVE" ]] ||
-        die "Backup archive does not exist: $ARCHIVE"
+    if [[ ! -f "$ARCHIVE" ]]; then
+        local requested_name="$(basename -- "$ARCHIVE")"
+        local candidate=""
+        for dir in             /home/ubuntu/server-backups             /home/Admin/server-backups             /backup             /backups             /mnt/backup             /mnt/backups; do
+            if [[ -f "$dir/$requested_name" ]]; then
+                candidate="$dir/$requested_name"
+                break
+            fi
+        done
 
-    ARCHIVE="$(realpath "$ARCHIVE")"
+        if [[ -n "$candidate" ]]; then
+            log "Backup path was not found at '$ARCHIVE'."
+            log "Found same archive by filename at: $candidate"
+            ARCHIVE="$candidate"
+        else
+            die "Backup archive does not exist: $ARCHIVE"
+        fi
+    fi
+
+    [[ -r "$ARCHIVE" ]] ||
+        die "Backup archive is not readable: $ARCHIVE"
+
+    ARCHIVE="$(realpath -e "$ARCHIVE")"
 
     init_logging
 
     log "============================================================"
     log "SERVER DISASTER RECOVERY RESTORE v$VERSION"
     log "============================================================"
+    detect_os
+    detect_container
+    resolve_docker_cli
+
     log "Archive: $ARCHIVE"
     log "Workspace: $RESTORE_ROOT"
     log "Log: $LOG_FILE"
@@ -1713,12 +1880,14 @@ main() {
     log "Execution environment: $([[ "$IN_CONTAINER" == 1 ]] && printf 'container' || printf 'host')"
     log "systemd available: $SYSTEMD_AVAILABLE"
     log "Docker socket available: $DOCKER_SOCKET_AVAILABLE"
-
-    detect_os
-    detect_container
     extract_archive
     show_backup_layout
     validate_selected_backup
+
+    if [[ "$PLAN_ONLY" == "1" ]]; then
+        log "PLAN_ONLY=1: archive and backup layout validated; no system changes will be made."
+        exit 0
+    fi
 
     # Installation happens AFTER archive validation.
     install_selected_packages
