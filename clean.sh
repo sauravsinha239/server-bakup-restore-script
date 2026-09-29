@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-sudo -i
 
 # ============================================
 # 1. STOP ALL SERVICES
