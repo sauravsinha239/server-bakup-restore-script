@@ -48,7 +48,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="4.0.0"
+VERSION="4.1.0"
 IN_CONTAINER=0
 CONTAINER_RUNTIME=""
 SYSTEMD_AVAILABLE=0
@@ -465,6 +465,79 @@ show_backup_layout() {
     done
 }
 
+choose_restore_components() {
+    # Keep non-interactive runs deterministic. Interactive runs get the old
+    # component-selection workflow back, with safe defaults.
+    if [[ ! -t 0 || "${NONINTERACTIVE:-0}" == "1" ]]; then
+        log "Non-interactive mode: using configured restore component defaults."
+        return 0
+    fi
+
+    # Container-aware defaults.
+    if [[ "$SYSTEMD_AVAILABLE" != "1" ]]; then
+        RESTORE_SYSTEMD=0
+    fi
+    if [[ "$IN_CONTAINER" == "1" && "$DOCKER_SOCKET_AVAILABLE" != "1" ]]; then
+        RESTORE_DOCKER=0
+    fi
+
+    echo
+    echo "============================================================"
+    echo " Restore components"
+    echo "============================================================"
+    echo "Answer Y to restore, N to skip. Defaults are shown in [ ]"
+    echo
+
+    local ans
+    read -r -p "Restore /var/www? [Y/n]: " ans
+    [[ -z "$ans" || "$ans" =~ ^[Yy]$ ]] && RESTORE_WWW=1 || RESTORE_WWW=0
+
+    read -r -p "Restore Nginx? [Y/n]: " ans
+    [[ -z "$ans" || "$ans" =~ ^[Yy]$ ]] && RESTORE_NGINX=1 || RESTORE_NGINX=0
+
+    read -r -p "Restore PostgreSQL? [Y/n]: " ans
+    [[ -z "$ans" || "$ans" =~ ^[Yy]$ ]] && RESTORE_POSTGRES=1 || RESTORE_POSTGRES=0
+
+    read -r -p "Restore MongoDB? [Y/n]: " ans
+    [[ -z "$ans" || "$ans" =~ ^[Yy]$ ]] && RESTORE_MONGO=1 || RESTORE_MONGO=0
+
+    read -r -p "Restore MSSQL? [y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] && RESTORE_MSSQL=1 || RESTORE_MSSQL=0
+
+    if [[ "$SYSTEMD_AVAILABLE" == "1" ]]; then
+        read -r -p "Restore systemd units? [Y/n]: " ans
+        [[ -z "$ans" || "$ans" =~ ^[Yy]$ ]] && RESTORE_SYSTEMD=1 || RESTORE_SYSTEMD=0
+    else
+        RESTORE_SYSTEMD=0
+        log "systemd unavailable: systemd restore disabled."
+    fi
+
+    read -r -p "Restore CrowdSec config? [Y/n]: " ans
+    [[ -z "$ans" || "$ans" =~ ^[Yy]$ ]] && RESTORE_CROWDSEC=1 || RESTORE_CROWDSEC=0
+
+    if [[ "$IN_CONTAINER" == "1" && "$DOCKER_SOCKET_AVAILABLE" != "1" ]]; then
+        RESTORE_DOCKER=0
+        log "Docker container without Docker socket: Docker volume restore disabled."
+    else
+        read -r -p "Restore Docker volumes? [Y/n]: " ans
+        [[ -z "$ans" || "$ans" =~ ^[Yy]$ ]] && RESTORE_DOCKER=1 || RESTORE_DOCKER=0
+    fi
+
+    read -r -p "Restore firewall? [y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] && RESTORE_FIREWALL=1 || RESTORE_FIREWALL=0
+
+    read -r -p "Restore SSH configuration? [y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] && RESTORE_SSH=1 || RESTORE_SSH=0
+
+    echo
+    log "Selected restore components:"
+    log "  WWW=$RESTORE_WWW NGINX=$RESTORE_NGINX POSTGRES=$RESTORE_POSTGRES MONGO=$RESTORE_MONGO MSSQL=$RESTORE_MSSQL"
+    log "  SYSTEMD=$RESTORE_SYSTEMD CROWDSEC=$RESTORE_CROWDSEC DOCKER=$RESTORE_DOCKER FIREWALL=$RESTORE_FIREWALL SSH=$RESTORE_SSH"
+
+    read -r -p "Continue with these selections? [Y/n]: " ans
+    [[ -z "$ans" || "$ans" =~ ^[Yy]$ ]] || die "Restore cancelled by user."
+}
+
 validate_selected_backup() {
     if [[ "$RESTORE_WWW" == 1 ]]; then
         [[ -f "$TREE/WWW/var-www.tar.gz" ]] ||
@@ -857,18 +930,41 @@ restore_www() {
         -xzf "$TREE/WWW/var-www.tar.gz" -C "$stage" ||
         die "/var/www archive extraction failed."
 
-    [[ -d "$stage/var/www" ]] ||
-        die "WWW archive layout invalid: expected var/www."
+    # Accept the two common backup layouts:
+    #   1) archive contains var/www/... (created from /)
+    #   2) archive contains the contents of /var/www directly
+    local source_dir=""
+    if [[ -d "$stage/var/www" ]]; then
+        source_dir="$stage/var/www"
+    elif [[ -d "$stage/www" && ! -d "$stage/var" ]]; then
+        source_dir="$stage/www"
+    else
+        # Direct-content layout is valid if extraction produced at least one
+        # file/directory and did not contain an unexpected top-level tree.
+        if find "$stage" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+            source_dir="$stage"
+        fi
+    fi
+
+    [[ -n "$source_dir" && -d "$source_dir" ]] ||
+        die "WWW archive layout invalid: expected var/www or direct /var/www contents."
+
+    local new_www="$RESTORE_ROOT/stage/www-activated"
+    rm -rf "$new_www"
+    safe_mkdir "$new_www" 0755
+    restore_copy "$source_dir" "$new_www"
 
     if [[ -e /var/www || -L /var/www ]]; then
         mv /var/www "$old" ||
             die "Could not move existing /var/www to $old"
     fi
 
-    mv "$stage/var/www" /var/www || {
+    mv "$new_www" /var/www || {
         [[ -e "$old" ]] && mv "$old" /var/www || true
         die "Could not activate restored /var/www; previous /var/www was restored."
     }
+    chown root:root /var/www
+    chmod 755 /var/www
 
     log "/var/www restored. Previous copy: $old"
 }
@@ -1882,6 +1978,7 @@ main() {
     log "Docker socket available: $DOCKER_SOCKET_AVAILABLE"
     extract_archive
     show_backup_layout
+    choose_restore_components
     validate_selected_backup
 
     if [[ "$PLAN_ONLY" == "1" ]]; then
