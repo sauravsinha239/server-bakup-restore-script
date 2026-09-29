@@ -1214,62 +1214,125 @@ pg_prepare_globals() {
     safe_mkdir "$(dirname "$output")" 0700
 
     local roles_file="$RESTORE_ROOT/pg-existing-roles.txt"
+
     run_as postgres psql -Atqc \
-        "SELECT rolname FROM pg_roles;" > "$roles_file"
+        "SELECT rolname FROM pg_roles;" > "$roles_file" ||
+        die "PostgreSQL: could not query existing roles."
 
     declare -A existing=()
     local role
+
     while IFS= read -r role; do
         [[ -n "$role" ]] && existing["$role"]=1
     done < "$roles_file"
 
     : > "$output"
 
-    local line decl role_name protected_line
+    local line decl role_name
     local create_role_re='^CREATE[[:space:]]+ROLE[[:space:]]+(.+);[[:space:]]*$'
-    local postgres_nologin_re='^[[:space:]]*ALTER[[:space:]]+ROLE[[:space:]]+("postgres"|postgres)([[:space:]]+.*)?NOLOGIN([^;]*);[[:space:]]*$'
 
     while IFS= read -r line || [[ -n "$line" ]]; do
-        # NEVER allow the backup globals to disable the native recovery role.
-        # pg_dumpall can contain statements such as:
-        #   ALTER ROLE postgres NOLOGIN;
-        #   ALTER ROLE postgres WITH NOSUPERUSER NOLOGIN;
-        # Those statements would lock out local peer authentication before
-        # the post-restore recovery check can run. Rewrite only NOLOGIN for
-        # the native postgres role; do not change any other role.
-        if [[ "$line" =~ $postgres_nologin_re ]]; then
-            protected_line="$(printf '%s\n' "$line" | sed -E 's/[[:space:]]NOLOGIN([[:space:]]*;)/ LOGIN\1/I')"
-            log "PostgreSQL: protecting native recovery role from NOLOGIN: $line"
-            printf '%s\n' "$protected_line" >> "$output"
-            continue
+
+        # ================================================================
+        # PROTECT NATIVE POSTGRES RECOVERY ACCOUNT
+        # ================================================================
+        #
+        # Examples:
+        #
+        # ALTER ROLE postgres NOLOGIN;
+        #
+        # ALTER ROLE postgres WITH SUPERUSER INHERIT
+        #     CREATEROLE CREATEDB NOLOGIN REPLICATION BYPASSRLS;
+        #
+        # Only modify the native "postgres" role.
+        # Other backup roles remain untouched.
+        # ================================================================
+
+        if [[ "$line" =~ ^[[:space:]]*ALTER[[:space:]]+ROLE[[:space:]]+(\"postgres\"|postgres)([[:space:]]+.*);[[:space:]]*$ ]]; then
+
+            if [[ "$line" =~ [[:space:]]NOLOGIN([[:space:]]|;) ]]; then
+
+                log "PostgreSQL: protecting native recovery role from NOLOGIN:"
+                log "  $line"
+
+                # Replace ONLY the NOLOGIN token.
+                line="$(printf '%s\n' "$line" | sed -E 's/[[:space:]]NOLOGIN([[:space:]]|;)/ LOGIN\1/I')"
+
+                log "PostgreSQL: protected statement:"
+                log "  $line"
+            fi
         fi
 
+        # ================================================================
+        # EXISTING ROLE HANDLING
+        # ================================================================
+
         if [[ "$line" =~ $create_role_re ]]; then
+
             decl="${BASH_REMATCH[1]}"
-            # globals.sql normally contains `CREATE ROLE <name> ...`.
-            # Extract only the role identifier; do not treat WITH attributes as
-            # part of the role name.
+
             if [[ "${decl:0:1}" == '"' ]]; then
-                role_name="$(printf '%s\n' "$decl" | sed -E 's/^"((""|[^"])*)".*/\1/')"
-                role_name="$(printf '%s\n' "$role_name" | sed 's/""/"/g')"
+
+                role_name="$(
+                    printf '%s\n' "$decl" |
+                        sed -E 's/^"(((""|[^"])*)).*/\1/'
+                )"
+
+                role_name="${role_name//\"\"/\"}"
+
             else
+
                 role_name="${decl%%[[:space:]]*}"
                 role_name="${role_name%;}"
+
             fi
 
             if [[ -n "${existing[$role_name]+yes}" ]]; then
-                printf -- '-- RESTORE-SKIPPED existing role: %s\n' "$role_name" >> "$output"
+
+                printf -- \
+                    '-- RESTORE-SKIPPED existing role: %s\n' \
+                    "$role_name" >> "$output"
+
             else
+
                 printf '%s\n' "$line" >> "$output"
+
             fi
+
         else
+
             printf '%s\n' "$line" >> "$output"
+
         fi
+
     done < "$input"
+
+    # ================================================================
+    # FINAL SAFETY NET
+    # ================================================================
+    #
+    # Even if pg_dumpall contains an unusual ALTER ROLE postgres statement,
+    # the native recovery account must finish with LOGIN + SUPERUSER.
+    #
+    # This is intentionally ONLY for postgres.
+    # ================================================================
+
+    cat >> "$output" <<'SQL'
+
+-- ================================================================
+-- RESTORE SAFETY: native PostgreSQL recovery account
+-- ================================================================
+
+ALTER ROLE postgres LOGIN;
+ALTER ROLE postgres SUPERUSER;
+
+SQL
 
     chown postgres:postgres "$output"
     chmod 600 "$output"
-    [[ -s "$output" ]] || die "Prepared PostgreSQL globals file is empty."
+
+    [[ -s "$output" ]] ||
+        die "Prepared PostgreSQL globals file is empty."
 
     log "PostgreSQL globals prepared: $output"
 }
