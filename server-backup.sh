@@ -723,11 +723,19 @@ if ! tar -tzf "$ARCHIVE" >/dev/null; then
 fi
 
 log "Creating detached SHA-256 checksum"
-if ! sha256sum "$(basename "$ARCHIVE")" > "${ARCHIVE}.sha256"; then
-  die "Failed to create archive checksum."
+
+ARCHIVE_ABS="$(realpath "$ARCHIVE")"
+CHECKSUM="${ARCHIVE_ABS}.sha256"
+
+[[ -f "$ARCHIVE_ABS" ]] || die "Archive not found: $ARCHIVE_ABS"
+
+if ! sha256sum "$ARCHIVE_ABS" > "$CHECKSUM"; then
+    die "Failed to create archive checksum."
 fi
 
-chmod 600 "$ARCHIVE" "${ARCHIVE}.sha256"
+chmod 600 "$ARCHIVE_ABS" "$CHECKSUM"
+
+log "SHA-256 checksum created: $CHECKSUM"
 
 # Cleanup working directory only after archive verification succeeds.
 rm -rf "$WORK"
