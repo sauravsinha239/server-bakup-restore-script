@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Server Disaster Recovery Restore
-# Version: 4.2.1
+# Version: 4.2.2
 #
 # Design:
 #   1. Preflight and identify OS / architecture
@@ -13,7 +13,7 @@
 #   8. Validate services/configuration
 #   9. Keep previous live configuration for rollback
 #
-# 4.2.0 fixes:
+# 4.2.2 fixes:
 #   - PostgreSQL pg_lsclusters parsing now handles all columns correctly.
 #   - PostgreSQL uses pg_ctlcluster --skip-systemctl-redirect in containers.
 #   - Microsoft APT sources are disabled outside sources.list.d (no APT warnings).
@@ -23,6 +23,12 @@
 #   - SHA verification is independent of stale filenames inside .sha256 files.
 #   - Nginx 1.24.x keeps legacy listen ... http2 syntax.
 #   - Interactive component selection remains enabled.
+#   - PostgreSQL recovery is pinned to the native postgres superuser; the
+#     script verifies existence, LOGIN, and SUPERUSER after globals restore.
+#   - MSSQL recovery is pinned to the native sa login; the script verifies
+#     ENABLED + sysadmin and assigns restored databases to sa.
+#   - MSSQL .bak files are VERIFYONLY checked and restored with FILELISTONLY
+#     MOVE clauses, WITH REPLACE, RECOVERY, and ONLINE verification.
 #   - PostgreSQL recovery role postgres is explicitly re-enabled after globals restore.
 #   - MSSQL recovery login sa is explicitly enabled after authentication.
 #   - Fresh MSSQL setup always establishes a new recovery password for sa.
@@ -62,7 +68,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="4.2.0"
+VERSION="4.2.2"
 IN_CONTAINER=0
 CONTAINER_RUNTIME=""
 SYSTEMD_AVAILABLE=0
@@ -1346,32 +1352,33 @@ start_postgres() {
 }
 
 pg_enable_recovery_roles() {
-    # Do NOT enable every role from the backup. Only the local recovery/admin
-    # role is repaired. globals.sql can contain ALTER ROLE postgres NOLOGIN.
-    local recovery_user="${PG_USER:-postgres}"
-    local recovery_ident
+    # PostgreSQL recovery ALWAYS uses the native local superuser "postgres".
+    # Do not create or enable arbitrary roles from the backup.
+    # pg_dumpall globals may contain ALTER ROLE postgres NOLOGIN, so this
+    # repair MUST happen after globals.sql is restored.
+    local role_state
 
-    recovery_ident="$(pg_sql_ident "$recovery_user")"
+    log "PostgreSQL: verifying native recovery account 'postgres'..."
 
-    log "PostgreSQL: ensuring recovery role '$recovery_user' has LOGIN..."
+    role_state="$(run_as postgres psql -d postgres -Atqc \
+        "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname='postgres') THEN 'EXISTS' ELSE 'MISSING' END;")" ||
+        die "PostgreSQL: could not query pg_roles using the local postgres OS account."
+
+    [[ "$role_state" == "EXISTS" ]] ||
+        die "PostgreSQL: native recovery role 'postgres' does not exist. Refusing to create a replacement recovery account automatically."
 
     run_as postgres psql -v ON_ERROR_STOP=1 -d postgres -c \
-        "ALTER ROLE \"$recovery_ident\" LOGIN;" ||
-        die "PostgreSQL: could not enable LOGIN for recovery role '$recovery_user'."
+        'ALTER ROLE postgres LOGIN;' ||
+        die "PostgreSQL: could not enable LOGIN for native recovery role 'postgres'."
 
-    # postgres is the native local superuser and is the final fallback account.
-    if [[ "$recovery_user" != "postgres" ]]; then
-        run_as postgres psql -v ON_ERROR_STOP=1 -d postgres -c \
-            'ALTER ROLE postgres LOGIN;' ||
-            die "PostgreSQL: could not enable LOGIN for role 'postgres'."
-    fi
+    role_state="$(run_as postgres psql -d postgres -Atqc \
+        "SELECT rolname || '|' || CASE WHEN rolcanlogin THEN 'LOGIN' ELSE 'NOLOGIN' END || '|' || CASE WHEN rolsuper THEN 'SUPERUSER' ELSE 'NOSUPERUSER' END FROM pg_roles WHERE rolname='postgres';")" ||
+        die "PostgreSQL: could not verify native recovery role 'postgres'."
 
-    log "PostgreSQL: recovery LOGIN state:"
-    run_as postgres psql -d postgres -Atqc \
-        "SELECT rolname || '|' || CASE WHEN rolcanlogin THEN 'LOGIN' ELSE 'NOLOGIN' END
-         FROM pg_roles
-         WHERE rolname IN ('postgres', '$(pg_sql_literal "$recovery_user")')
-         ORDER BY rolname;" || true
+    [[ "$role_state" == 'postgres|LOGIN|SUPERUSER' ]] ||
+        die "PostgreSQL: native recovery role verification failed: $role_state"
+
+    log "PostgreSQL: recovery account OK: $role_state"
 }
 
 restore_postgres() {
@@ -1691,29 +1698,38 @@ mssql_sqlcmd() {
 }
 
 mssql_enable_recovery_login() {
-    # Keep the built-in sa account as the recovery account.
-    # This must run after a successful SQL authentication.
-    log "MSSQL: ensuring recovery login [sa] is enabled..."
+    # The built-in sa account is the native recovery account. A database .bak
+    # does not restore server-level login state, so verify/repair it explicitly.
+    log "MSSQL: verifying native recovery login [sa]..."
 
     mssql_sqlcmd -Q "
 IF NOT EXISTS (
-    SELECT 1
-    FROM sys.server_principals
-    WHERE name = N'sa'
+    SELECT 1 FROM sys.server_principals WHERE name = N'sa'
 )
-BEGIN
     THROW 50001, 'Built-in recovery login [sa] does not exist.', 1;
-END;
 
 ALTER LOGIN [sa] ENABLE;
+ALTER SERVER ROLE [sysadmin] ADD MEMBER [sa];
 
-SELECT name, is_disabled
+SELECT
+    name,
+    is_disabled,
+    IS_SRVROLEMEMBER(N'sysadmin', N'sa') AS is_sysadmin
 FROM sys.server_principals
 WHERE name = N'sa';
 " ||
-        die "MSSQL: could not enable recovery login [sa]. Current credentials must have sufficient server permissions."
+        die "MSSQL: could not enable/verify [sa]. The supplied login must have sufficient server-level permissions."
 
-    log "MSSQL: recovery login [sa] is enabled."
+    local sa_state
+    sa_state="$(mssql_sqlcmd -h -1 -W -s '|' -Q \
+        "SELECT CAST(is_disabled AS varchar(10)) + '|' + CAST(IS_SRVROLEMEMBER(N'sysadmin', N'sa') AS varchar(10)) FROM sys.server_principals WHERE name=N'sa';")" ||
+        die "MSSQL: could not read [sa] recovery state."
+
+    sa_state="$(printf '%s\n' "$sa_state" | tr -d '\r' | tail -n 1)"
+    [[ "$sa_state" == '0|1' ]] ||
+        die "MSSQL: recovery login [sa] verification failed: $sa_state"
+
+    log "MSSQL: recovery account OK: sa|ENABLED|SYSADMIN"
 }
 
 restore_mssql() {
@@ -1863,10 +1879,18 @@ ALTER DATABASE [$qdb] SET MULTI_USER;
         # Verify database exists and is online.
         mssql_sqlcmd -h -1 -W -Q \
             "SELECT state_desc FROM sys.databases WHERE name=N'$(mssql_lit "$db")';" |
+            tr -d '\r' |
             grep -qx 'ONLINE' ||
             die "MSSQL verification failed: database $db is not ONLINE."
 
-        log "MSSQL [$i/${#baks[@]}]: OK"
+        # sa is sysadmin, so it has full access to every restored database.
+        # Make the ownership explicit as well; this also avoids orphaned
+        # database-owner state from the source server.
+        mssql_sqlcmd -Q \
+            "ALTER AUTHORIZATION ON DATABASE::[$qdb] TO [sa];" ||
+            die "MSSQL verification failed: could not assign database owner to sa for $db."
+
+        log "MSSQL [$i/${#baks[@]}]: ONLINE + owner=sa + sysadmin access OK"
     done
 
     # Final safety check: database restores are complete, so verify the
