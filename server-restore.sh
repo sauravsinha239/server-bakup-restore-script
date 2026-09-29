@@ -1,52 +1,138 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
-umask 077
-
-# Production server disaster-recovery restore helper.
-# Usage:
-#   sudo ./server-restore.sh /path/to/server-backup-HOST-DATE.tar.gz
+# Server Disaster Recovery Restore
+# Version: 4.2.2
 #
-# Designed for the backup format produced by server-backup-all-db.sh.
+# Design:
+#   1. Preflight and identify OS / architecture
+#   2. Verify archive and detached SHA-256
+#   3. Extract backup into a private immutable-ish workspace
+#   4. Validate backup layout before changing the live system
+#   5. Install missing software using the native/official repository
+#   6. Stage database backup files into service-owned directories
+#   7. Restore databases
+#   8. Validate services/configuration
+#   9. Keep previous live configuration for rollback
+#
+# 4.2.2 fixes:
+#   - PostgreSQL pg_lsclusters parsing now handles all columns correctly.
+#   - PostgreSQL uses pg_ctlcluster --skip-systemctl-redirect in containers.
+#   - Microsoft APT sources are disabled outside sources.list.d (no APT warnings).
+#   - MSSQL tools use Microsoft's packages-microsoft-prod.deb bootstrap.
+#   - MSSQL waits for SQL Server readiness before RESTORE.
+#   - MongoDB direct-start waits for a real ping before restore.
+#   - SHA verification is independent of stale filenames inside .sha256 files.
+#   - Nginx 1.24.x keeps legacy listen ... http2 syntax.
+#   - Interactive component selection remains enabled.
+#   - PostgreSQL recovery is pinned to the native postgres superuser; the
+#     script verifies existence, LOGIN, and SUPERUSER after globals restore.
+#   - MSSQL recovery is pinned to the native sa login; the script verifies
+#     ENABLED + sysadmin and assigns restored databases to sa.
+#   - MSSQL .bak files are VERIFYONLY checked and restored with FILELISTONLY
+#     MOVE clauses, WITH REPLACE, RECOVERY, and ONLINE verification.
+#   - PostgreSQL recovery role postgres is explicitly re-enabled after globals restore.
+#   - MSSQL recovery login sa is explicitly enabled after authentication.
+#   - Fresh MSSQL setup always establishes a new recovery password for sa.
 #
 # IMPORTANT:
-# - Database restores are destructive when the target database already exists.
-# - Nginx/SSL are validated before the new Nginx config is activated.
-# - Firewall and SSH restoration are OFF by default in the checkbox menu.
-# - Temporary extracted files are retained by default.
+#   - Run as root.
+#   - Database restores are destructive for databases with the same name.
+#   - The backup tree is NEVER recursively chowned.
+#   - Firewall and SSH restoration are OFF by default.
+#
+# Usage:
+#   sudo ./server-restore-production-4.2.0.sh /path/to/backup.tar.gz
+#   Docker container:
+#   docker run --rm -it -v /path/to/backups:/backup:ro \
+#       -v /var/run/docker.sock:/var/run/docker.sock \
+#       ubuntu:24.04
+#   ./server-restore-production-4.2.0.sh \
+#       /backup/server-backup-YYYY-MM-DD_HHMMSS.tar.gz
+#
+# Debug:
+#   sudo DEBUG=1 ./server-restore-production-4.2.0.sh /path/to/backup.tar.gz
+#
+# Optional environment:
+#   RESTORE_ROOT=/var/tmp/my-restore
+#   LOG_FILE=/var/log/server-restore.log
+#   KEEP_STAGING=1
+#   PLAN_ONLY=1             # verify archive/layout without modifying the system
+#   CHECKSUM_FILE=/path/to/archive.sha256
+#   PG_VERSION=18
+#   MONGO_VERSION=8.0
+#   MSSQL_PID=Developer
+#   MSSQL_PASSWORD='...'
+#   PG_PASSWORD='...'
+#   MONGO_URI='mongodb://127.0.0.1:27017'
 
-SCRIPT_VERSION="2.5.0"
-ARCHIVE="${1:-}"
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
 
-# Normalize the archive path once so every later operation is independent
-# of the caller's current working directory.
-if [[ -n "$ARCHIVE" && -f "$ARCHIVE" ]]; then
-    ARCHIVE="$(realpath "$ARCHIVE")"
-fi
-
-[[ -n "$ARCHIVE" && -f "$ARCHIVE" ]] || {
-    echo "Usage: $0 /path/to/server-backup-HOST-DATE.tar.gz"
-    exit 1
-}
-[[ $EUID -eq 0 ]] || {
-    echo "ERROR: Run as root."
-    exit 1
-}
+VERSION="4.2.2"
+IN_CONTAINER=0
+CONTAINER_RUNTIME=""
+SYSTEMD_AVAILABLE=0
+DOCKER_SOCKET_AVAILABLE=0
+ARCHIVE="${1:-${BACKUP_ARCHIVE:-}}"
+DEBUG="${DEBUG:-0}"
+KEEP_STAGING="${KEEP_STAGING:-1}"
+PLAN_ONLY="${PLAN_ONLY:-0}"
+CHECKSUM_FILE="${CHECKSUM_FILE:-}"
 
 RESTORE_ROOT="${RESTORE_ROOT:-/var/tmp/server-restore-$(date +%Y%m%d_%H%M%S)}"
+LOG_FILE="${LOG_FILE:-/var/log/server-restore.log}"
+TRACE_FILE="$RESTORE_ROOT/debug.trace"
 TREE=""
-ERRORS=0
+OS_ID=""
+OS_VERSION=""
+OS_CODENAME=""
+ARCH=""
+PACKAGE_MANAGER=""
+
+RESTORE_WWW=1
+RESTORE_NGINX=1
+RESTORE_POSTGRES=1
+RESTORE_MONGO=1
+RESTORE_MSSQL=0
+RESTORE_SYSTEMD=1
+RESTORE_CROWDSEC=1
+RESTORE_DOCKER=1
+RESTORE_FIREWALL=0
+RESTORE_SSH=0
+
 WARNINGS=0
+ERRORS=0
+APT_DISABLED=()
+CLEANUP_DONE=0
+PG_STAGE=""
+ORIGINAL_ARCHIVE_ARG="${1:-}"
 
-# Package policy: selected restore packages are upgraded/installed.
-# No full Debian/Ubuntu upgrade is performed automatically.
-UPGRADE_SELECTED_PACKAGES=1
+# Runtime state
+DOCKER_CMD=""
+PG_SERVICE=""
+MONGO_SERVICE=""
 
-# -------------------------------------------------------------------
-# Logging / error handling
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+init_logging() {
+    mkdir -p "$RESTORE_ROOT"
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    touch "$LOG_FILE" 2>/dev/null || LOG_FILE="$RESTORE_ROOT/restore.log"
+    chmod 600 "$LOG_FILE" 2>/dev/null || true
+
+    if [[ "$DEBUG" == "1" ]]; then
+        exec 19>"$TRACE_FILE"
+        export BASH_XTRACEFD=19
+        PS4='+ ${BASH_SOURCE}:${LINENO}:${FUNCNAME[0]}: '
+        set -x
+    fi
+}
 
 log() {
-    printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+    local msg="[$(date '+%F %T')] $*"
+    printf '%s\n' "$msg" | tee -a "$LOG_FILE"
 }
 
 warn() {
@@ -59,1404 +145,2157 @@ die() {
     exit 1
 }
 
-cmd() {
+on_err() {
+    local rc=$?
+    local line="${BASH_LINENO[0]:-unknown}"
+    local command="${BASH_COMMAND:-unknown}"
+    log "ERROR: rc=$rc line=$line command=$command"
+    log "ERROR: restore workspace: $RESTORE_ROOT"
+    log "ERROR: log: $LOG_FILE"
+    [[ "$DEBUG" == "1" ]] && log "ERROR: trace: $TRACE_FILE"
+    exit "$rc"
+}
+
+trap on_err ERR
+
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+have_cmd() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# -------------------------------------------------------------------
-# Interactive checkbox menu
-# -------------------------------------------------------------------
-
-prompt_with_default() {
-    local var_name="$1"
-    local label="$2"
-    local default="$3"
-    local current="${!var_name:-$default}"
-    local input
-
-    if [[ -t 0 ]]; then
-        if [[ -n "$default" ]]; then
-            read -r -p "$label [default: $default]: " input
-        else
-            read -r -p "$label [ENTER = none]: " input
-        fi
-        input="${input:-$default}"
-    else
-        input="$current"
-    fi
-
-    printf -v "$var_name" '%s' "$input"
-}
-
-prompt_password() {
-    local var_name="$1"
-    local label="$2"
-    local current="${!var_name:-}"
-    local input
-
-    if [[ -n "$current" ]]; then
-        return 0
-    fi
-
-    if [[ -t 0 ]]; then
-        read -r -s -p "$label password: " input
-        echo
-        printf -v "$var_name" '%s' "$input"
-    else
-        printf -v "$var_name" '%s' ""
-    fi
-}
-
-menu_checkbox() {
-    local title="$1"
+run_as() {
+    local user="$1"
     shift
-    local -a labels=("$@")
-    local -a selected=("${MENU_SELECTED[@]}")
-    local cursor=0
-    local key seq i mark
-
-    [[ -t 0 && -t 1 ]] || return 0
-
-    while true; do
-        printf '\033[2J\033[H'
-        printf '\n'
-        printf '============================================================\n'
-        printf ' %s\n' "$title"
-        printf '============================================================\n\n'
-        printf '  ↑/↓  Move    SPACE  Select/Deselect    ENTER  Continue    q  Quit\n\n'
-
-        for i in "${!labels[@]}"; do
-            if [[ "${selected[$i]}" == 1 ]]; then
-                mark='✓'
-            else
-                mark=' '
-            fi
-
-            if ((i == cursor)); then
-                printf '\033[7m'
-                printf '  [%s] %s\n' "$mark" "${labels[$i]}"
-                printf '\033[0m'
-            else
-                printf '  [%s] %s\n' "$mark" "${labels[$i]}"
-            fi
-        done
-
-        printf '\n'
-        printf '  Selected components will have their required packages\n'
-        printf '  installed/upgraded automatically before restore.\n'
-
-        IFS= read -r -s -n 1 key || die "Unable to read terminal input."
-
-        case "$key" in
-            $'\x1b')
-                IFS= read -r -s -n 2 seq || true
-                case "$seq" in
-                    '[A') ((cursor > 0)) && cursor=$((cursor - 1)) ;;
-                    '[B') ((cursor < ${#labels[@]} - 1)) && cursor=$((cursor + 1)) ;;
-                    '[5~') cursor=$((cursor - 5)); ((cursor < 0)) && cursor=0 ;;
-                    '[6~') cursor=$((cursor + 5)); ((cursor >= ${#labels[@]})) && cursor=$((${#labels[@]} - 1)) ;;
-                esac
-                ;;
-            ' ')
-                selected[$cursor]=$((1 - selected[$cursor]))
-                ;;
-            '')
-                MENU_SELECTED=("${selected[@]}")
-                return 0
-                ;;
-            q|Q)
-                die "Restore cancelled."
-                ;;
-        esac
-    done
-}
-
-choose_components() {
-    echo
-    echo "============================================================"
-    echo " SERVER DISASTER RECOVERY RESTORE v$SCRIPT_VERSION"
-    echo "============================================================"
-    echo
-    echo "Archive:"
-    echo "  $ARCHIVE"
-    echo
-
-    local -a labels=(
-        "/var/www"
-        "Nginx + Let's Encrypt"
-        "PostgreSQL"
-        "MongoDB"
-        "Microsoft SQL Server"
-        "Custom systemd units"
-        "CrowdSec configuration"
-        "Docker volumes"
-        "Firewall rules"
-        "SSH configuration"
-    )
-
-    # Defaults: common application/runtime pieces ON; MSSQL/firewall/SSH OFF.
-    MENU_SELECTED=(1 1 1 1 0 1 1 1 0 0)
-    menu_checkbox "SELECT RESTORE COMPONENTS" "${labels[@]}"
-
-    RESTORE_WWW="${MENU_SELECTED[0]}"
-    RESTORE_NGINX="${MENU_SELECTED[1]}"
-    RESTORE_POSTGRES="${MENU_SELECTED[2]}"
-    RESTORE_MONGO="${MENU_SELECTED[3]}"
-    RESTORE_MSSQL="${MENU_SELECTED[4]}"
-    RESTORE_SYSTEMD="${MENU_SELECTED[5]}"
-    RESTORE_CROWDSEC="${MENU_SELECTED[6]}"
-    RESTORE_DOCKER="${MENU_SELECTED[7]}"
-    RESTORE_FIREWALL="${MENU_SELECTED[8]}"
-    RESTORE_SSH="${MENU_SELECTED[9]}"
-
-    echo
-    echo "Selected components:"
-    printf '  /var/www                 : %s\n' "$RESTORE_WWW"
-    printf "  Nginx + Let\'s Encrypt     : %s\n" "$RESTORE_NGINX"
-    printf '  PostgreSQL                : %s\n' "$RESTORE_POSTGRES"
-    printf '  MongoDB                   : %s\n' "$RESTORE_MONGO"
-    printf '  Microsoft SQL Server     : %s\n' "$RESTORE_MSSQL"
-    printf '  systemd                   : %s\n' "$RESTORE_SYSTEMD"
-    printf '  CrowdSec                  : %s\n' "$RESTORE_CROWDSEC"
-    printf '  Docker                    : %s\n' "$RESTORE_DOCKER"
-    printf '  Firewall                  : %s\n' "$RESTORE_FIREWALL"
-    printf '  SSH                       : %s\n' "$RESTORE_SSH"
-    echo
-}
-
-# -------------------------------------------------------------------
-# Package bootstrap / upgrade
-# -------------------------------------------------------------------
-
-APT_DISABLED_REPOS=()
-
-# Recover stale repository files left by an interrupted/older restore run.
-# Example: mssql-release.list.restore-disabled.restore-disabled
-# Only recover the original .list/.sources name when that original file is absent.
-recover_stale_apt_repository_files() {
-    local f original
-    while IFS= read -r -d '' f; do
-        original="$f"
-        while [[ "$original" == *.restore-disabled ]]; do
-            original="${original%.restore-disabled}"
-        done
-
-        if [[ "$original" == *.list || "$original" == *.sources ]]; then
-            if [[ ! -e "$original" ]]; then
-                mv -f -- "$f" "$original" || warn "Could not recover stale APT repository file: $f"
-                log "Recovered stale Microsoft APT source: $original"
-            else
-                # The active source already exists; stale backup is not an active
-                # repository and can safely remain untouched for manual review.
-                log "Leaving stale disabled APT source untouched: $f"
-            fi
-        fi
-    done < <(find /etc/apt/sources.list.d -maxdepth 1 -type f -name '*.restore-disabled*' -print0 2>/dev/null || true)
-}
-
-restore_apt_repositories() {
-    local f original
-    for f in "${APT_DISABLED_REPOS[@]:-}"; do
-        [[ -f "$f" ]] || continue
-        original="${f%.restore-disabled}"
-        mv -f -- "$f" "$original" || warn "Could not restore APT repository file: $original"
-    done
-    APT_DISABLED_REPOS=()
-}
-
-# Always put temporarily disabled repositories back, even if package setup fails.
-trap restore_apt_repositories EXIT
-
-setup_mongodb_apt_repo() {
-    local id="$1" version_codename="$2" arch
-    arch="$(dpkg --print-architecture)"
-
-    case "$id:$version_codename" in
-        ubuntu:noble|ubuntu:jammy|ubuntu:focal)
-            ;;
-        debian:bookworm)
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-
-    cmd curl || apt-get install -y curl
-    cmd gpg || apt-get install -y gnupg
-
-    install -d -m 0755 /usr/share/keyrings
-    curl -fsSL https://pgp.mongodb.com/server-8.0.asc |
-        gpg --dearmor --yes -o /usr/share/keyrings/mongodb-server-8.0.gpg
-    chmod 0644 /usr/share/keyrings/mongodb-server-8.0.gpg
-
-    local list_file="/etc/apt/sources.list.d/mongodb-org-8.0.list"
-    if [[ "$id" == "ubuntu" ]]; then
-        cat > "$list_file" <<EOF
-# Managed by server-restore.sh
-# MongoDB Community 8.0 official repository
- deb [ arch=${arch} signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg ] https://repo.mongodb.org/apt/ubuntu ${version_codename}/mongodb-org/8.0 multiverse
-EOF
+    if have_cmd runuser; then
+        runuser -u "$user" -- "$@"
+    elif have_cmd su; then
+        su -s /bin/sh "$user" -c "$(printf '%q ' "$@")"
     else
-        cat > "$list_file" <<EOF
-# Managed by server-restore.sh
-# MongoDB Community 8.0 official repository
- deb [ arch=${arch} signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg ] https://repo.mongodb.org/apt/debian ${version_codename}/mongodb-org/8.0 main
-EOF
+        die "Neither runuser nor su is available; cannot run as $user."
     fi
-    sed -i 's/^ deb/deb/' "$list_file"
-    chmod 0644 "$list_file"
-    log "MongoDB: official MongoDB 8.0 APT repository configured."
 }
 
-setup_mssql_apt_repo() {
-    local version_id="$1"
-
-    [[ "$ID" == "ubuntu" ]] || return 1
-
-    cmd curl || apt-get install -y curl
-    cmd gpg || apt-get install -y gnupg
-
-    case "$version_id" in
-        24.04)
-            local repo_url="https://packages.microsoft.com/config/ubuntu/24.04/mssql-server-2025.list"
-            ;;
-        22.04)
-            local repo_url="https://packages.microsoft.com/config/ubuntu/22.04/mssql-server-2025.list"
-            ;;
-        20.04)
-            local repo_url="https://packages.microsoft.com/config/ubuntu/20.04/mssql-server-2022.list"
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-
-    install -d -m 0755 /usr/share/keyrings
-    curl -fsSL https://packages.microsoft.com/keys/microsoft.asc |
-        gpg --dearmor --yes -o /usr/share/keyrings/microsoft-prod.gpg
-    chmod 0644 /usr/share/keyrings/microsoft-prod.gpg
-
-    local list_file="/etc/apt/sources.list.d/mssql-server-restore.list"
-    curl -fsSL "$repo_url" -o "$list_file"
-    chmod 0644 "$list_file"
-    log "MSSQL: Microsoft SQL Server repository configured for Ubuntu ${version_id}."
+systemd_usable() {
+    (( SYSTEMD_AVAILABLE == 1 ))
 }
 
-install_selected_packages() {
-    [[ -f /etc/os-release ]] || return 0
+unit_exists() {
+    local unit="$1"
+    systemd_usable || return 1
+    systemctl list-unit-files "$unit" >/dev/null 2>&1
+}
+
+service_active() {
+    local svc="$1"
+    systemd_usable || return 1
+    systemctl is-active --quiet "$svc"
+}
+
+service_start() {
+    local svc="$1"
+    if systemd_usable; then
+        systemctl enable "$svc" >/dev/null 2>&1 || true
+        systemctl start "$svc" || return 1
+        systemctl is-active --quiet "$svc"
+    else
+        warn "systemd is unavailable; cannot start service unit '$svc' directly."
+        return 1
+    fi
+}
+
+service_restart() {
+    local svc="$1"
+    if systemd_usable; then
+        systemctl restart "$svc" || return 1
+        systemctl is-active --quiet "$svc"
+    else
+        warn "systemd is unavailable; cannot restart service unit '$svc'."
+        return 1
+    fi
+}
+
+require_root() {
+    [[ "$EUID" -eq 0 ]] || die "Run this script as root."
+}
+
+# Ensure Docker CLI is selected from either normal PATH or common locations.
+detect_container() {
+    IN_CONTAINER=0
+    CONTAINER_RUNTIME=""
+    SYSTEMD_AVAILABLE=0
+    DOCKER_SOCKET_AVAILABLE=0
+
+    if [[ -f /.dockerenv ]]; then
+        IN_CONTAINER=1
+        CONTAINER_RUNTIME="docker"
+    elif [[ -r /proc/1/cgroup ]] &&
+         grep -qaE '(docker|containerd|kubepods|podman|libpod)' /proc/1/cgroup 2>/dev/null; then
+        IN_CONTAINER=1
+        CONTAINER_RUNTIME="container-runtime"
+    elif [[ -r /proc/1/environ ]] &&
+         tr '\0' '\n' < /proc/1/environ 2>/dev/null | grep -q '^container='; then
+        IN_CONTAINER=1
+        CONTAINER_RUNTIME="container"
+    fi
+
+    if have_cmd systemctl && [[ -d /run/systemd/system ]] &&
+       systemctl list-units --no-pager >/dev/null 2>&1; then
+        SYSTEMD_AVAILABLE=1
+    fi
+
+    if [[ -S /var/run/docker.sock || -S /run/docker.sock ]]; then
+        DOCKER_SOCKET_AVAILABLE=1
+    fi
+
+    if (( IN_CONTAINER )); then
+        log "Container environment detected: ${CONTAINER_RUNTIME:-unknown}"
+    else
+        log "Host environment detected."
+    fi
+    log "systemd available: $SYSTEMD_AVAILABLE"
+    log "Docker socket available: $DOCKER_SOCKET_AVAILABLE"
+}
+
+resolve_docker_cli() {
+    if have_cmd docker; then
+        DOCKER_CMD="$(command -v docker)"
+    elif [[ -x /usr/bin/docker ]]; then
+        DOCKER_CMD=/usr/bin/docker
+    else
+        DOCKER_CMD=""
+    fi
+}
+
+detect_os() {
+    [[ -r /etc/os-release ]] || die "/etc/os-release not found."
     # shellcheck disable=SC1091
     source /etc/os-release
 
-    case "$ID" in
-        ubuntu|debian)
-            export DEBIAN_FRONTEND=noninteractive
+    OS_ID="${ID:-unknown}"
+    OS_VERSION="${VERSION_ID:-unknown}"
+    OS_CODENAME="${VERSION_CODENAME:-}"
 
-            local microsoft_files=()
-            local ms_source
-
-            recover_stale_apt_repository_files
-
-            # If MSSQL is not selected, temporarily disable only ACTIVE Microsoft
-            # APT sources. Never scan *.restore-disabled* files; those are backup
-            # names and must not be disabled again.
-            if [[ "$RESTORE_MSSQL" != 1 ]]; then
-                while IFS= read -r -d '' f; do
-                    microsoft_files+=("$f")
-                done < <(
-                    {
-                        [[ -f /etc/apt/sources.list ]] && printf '%s\0' /etc/apt/sources.list
-                        find /etc/apt/sources.list.d -maxdepth 1 -type f \
-                            \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null || true
-                    } | while IFS= read -r -d '' f; do
-                        if grep -qiE 'packages\.microsoft\.com' "$f" 2>/dev/null; then
-                            printf '%s\0' "$f"
-                        fi
-                    done
-                )
-
-                for f in "${microsoft_files[@]}"; do
-                    [[ -f "$f" ]] || continue
-                    ms_source="${f}.restore-disabled"
-                    mv -f -- "$f" "$ms_source"
-                    APT_DISABLED_REPOS+=("$ms_source")
-                    log "Temporarily disabled Microsoft APT source: $f"
-                done
-            fi
-
-            log "Installing/upgrading base restore tools..."
-            apt-get update
-
-            local -a pkgs=(tar gzip coreutils ca-certificates curl gnupg)
-            [[ "$RESTORE_NGINX" == 1 ]]    && pkgs+=(nginx)
-            [[ "$RESTORE_POSTGRES" == 1 ]] && pkgs+=(postgresql postgresql-client)
-            [[ "$RESTORE_DOCKER" == 1 ]]   && pkgs+=(docker.io)
-            [[ "$RESTORE_SSH" == 1 ]]      && pkgs+=(openssh-server)
-            [[ "$RESTORE_FIREWALL" == 1 ]] && pkgs+=(ufw iptables nftables)
-
-            # MongoDB official repository on supported Ubuntu/Debian releases.
-            if [[ "$RESTORE_MONGO" == 1 ]]; then
-                if ! cmd mongorestore || ! cmd mongod; then
-                    if setup_mongodb_apt_repo "$ID" "${VERSION_CODENAME:-}"; then
-                        apt-get update
-                        pkgs+=(mongodb-org)
-                    else
-                        die "MongoDB is not installed and automatic repository setup is unsupported for $ID ${VERSION_ID:-unknown}."
-                    fi
-                fi
-            fi
-
-            # MSSQL official repository + server/tools on supported Ubuntu.
-            if [[ "$RESTORE_MSSQL" == 1 ]]; then
-                if [[ "$ID" != "ubuntu" ]]; then
-                    die "Automatic fresh MSSQL installation is supported here only on Ubuntu. Install Microsoft SQL Server separately on this OS, then rerun the restore."
-                fi
-                if ! cmd sqlcmd || ! cmd mssql-conf || ! cmd systemctl || ! systemctl list-unit-files mssql-server.service >/dev/null 2>&1; then
-                    setup_mssql_apt_repo "$VERSION_ID" ||
-                        die "Unsupported Ubuntu version for the automatic MSSQL restore bootstrap: $VERSION_ID"
-                    apt-get update
-                    pkgs+=(mssql-server mssql-tools18 unixodbc-dev)
-                fi
-            fi
-
-            if [[ "$UPGRADE_SELECTED_PACKAGES" == 1 && ${#pkgs[@]} -gt 0 ]]; then
-                log "Upgrading selected restore packages where newer versions are available..."
-                apt-get install -y --only-upgrade "${pkgs[@]}" ||
-                    warn "Some selected packages were not already installed; normal installation will handle them."
-            fi
-
-            log "Installing required restore packages..."
-            apt-get install -y "${pkgs[@]}"
-
-            # Ensure command-line database tools are available when the server
-            # packages are already installed but PATH is not configured.
-            if [[ "$RESTORE_MONGO" == 1 ]] && ! cmd mongorestore; then
-                [[ -x /usr/bin/mongorestore ]] && ln -sf /usr/bin/mongorestore /usr/local/bin/mongorestore
-            fi
-
-            if [[ "$RESTORE_MSSQL" == 1 ]]; then
-                if [[ -x /opt/mssql-tools18/bin/sqlcmd ]]; then
-                    ln -sf /opt/mssql-tools18/bin/sqlcmd /usr/local/bin/sqlcmd
-                fi
-                cmd sqlcmd || die "sqlcmd is not available after MSSQL tools installation."
-                [[ -x /opt/mssql/bin/mssql-conf ]] || die "mssql-conf is not available after MSSQL installation."
-            fi
-
-            restore_apt_repositories
+    case "$OS_ID" in
+        ubuntu|debian|arch)
             ;;
-
-        arch)
-            log "Synchronizing Arch repositories and upgrading the system..."
-            pacman -Syu --noconfirm --needed
-
-            local -a pkgs=()
-            [[ "$RESTORE_NGINX" == 1 ]]    && pkgs+=(nginx)
-            [[ "$RESTORE_POSTGRES" == 1 ]] && pkgs+=(postgresql)
-            [[ "$RESTORE_DOCKER" == 1 ]]   && pkgs+=(docker)
-            [[ "$RESTORE_SSH" == 1 ]]      && pkgs+=(openssh)
-            [[ "$RESTORE_FIREWALL" == 1 ]] && pkgs+=(ufw iptables-nft nftables)
-
-            if [[ "$RESTORE_MONGO" == 1 ]]; then
-                if ! cmd mongorestore; then
-                    die "MongoDB Database Tools are not installed on Arch. Install mongorestore from your approved repository/AUR first."
-                fi
-            fi
-
-            if [[ "$RESTORE_MSSQL" == 1 ]]; then
-                die "Automatic fresh MSSQL installation is not provided for Arch. Install a supported Microsoft SQL Server Linux package separately, then rerun the restore."
-            fi
-
-            if ((${#pkgs[@]})); then
-                log "Installing/upgrading selected Arch restore packages..."
-                pacman -S --noconfirm --needed "${pkgs[@]}"
-            fi
-            ;;
-
         *)
-            warn "Unsupported package-manager OS: $ID"
+            die "Unsupported operating system: $OS_ID $OS_VERSION"
             ;;
     esac
+
+    ARCH="$(dpkg --print-architecture 2>/dev/null || true)"
+    [[ -n "$ARCH" ]] || ARCH="$(uname -m)"
+
+    case "$OS_ID" in
+        ubuntu|debian) PACKAGE_MANAGER="apt" ;;
+        arch) PACKAGE_MANAGER="pacman" ;;
+    esac
+
+    log "OS: $OS_ID $OS_VERSION ${OS_CODENAME:-}"
+    log "Architecture: $ARCH"
+    log "Package manager: $PACKAGE_MANAGER"
 }
 
-# -------------------------------------------------------------------
-# Archive integrity and extraction
-# -------------------------------------------------------------------
+safe_mkdir() {
+    local path="$1"
+    local mode="${2:-0755}"
+    install -d -m "$mode" "$path"
+}
+
+backup_live_path() {
+    local path="$1"
+    local stamp="$2"
+    local backup="${path}.before-restore-${stamp}"
+
+    if [[ -e "$path" || -L "$path" ]]; then
+        mv -- "$path" "$backup" || die "Could not move existing $path to $backup"
+        printf '%s\n' "$backup"
+    else
+        printf '%s\n' ""
+    fi
+}
+
+restore_copy() {
+    # Copy source tree WITHOUT changing source ownership.
+    # rsync is preferred because it handles ACL/xattr/hardlink metadata.
+    local src="$1"
+    local dst="$2"
+
+    [[ -d "$src" ]] || die "Source directory does not exist: $src"
+    safe_mkdir "$dst"
+
+    if have_cmd rsync; then
+        rsync -aHAX --numeric-ids -- "$src"/ "$dst"/
+    else
+        tar --acls --xattrs --numeric-owner -C "$src" -cf - . |
+            tar --acls --xattrs --numeric-owner -C "$dst" -xpf -
+    fi
+}
+
+verify_file() {
+    local file="$1"
+    [[ -f "$file" ]] || die "Required backup file does not exist: $file"
+    [[ -r "$file" ]] || die "Required backup file is not readable: $file"
+    [[ -s "$file" ]] || die "Required backup file is empty: $file"
+}
+
+# ---------------------------------------------------------------------------
+# Archive verification / extraction
+# ---------------------------------------------------------------------------
+
+verify_sha256() {
+    local archive="$1"
+    local checksum="$2"
+    local expected actual checksum_line
+
+    [[ -f "$archive" ]] || die "Backup archive does not exist: $archive"
+    [[ -r "$archive" ]] || die "Backup archive is not readable: $archive"
+    [[ -s "$archive" ]] || die "Backup archive is empty: $archive"
+    [[ -f "$checksum" ]] || die "SHA-256 file does not exist: $checksum"
+    [[ -r "$checksum" ]] || die "SHA-256 file is not readable: $checksum"
+
+    checksum_line="$(awk '
+        {
+            x=$1
+            if (length(x)==64 && x ~ /^[0-9A-Fa-f]+$/) { print; exit }
+        }
+    ' "$checksum")"
+    expected="$(printf '%s\n' "$checksum_line" | awk '{print $1}')"
+
+    [[ "$expected" =~ ^[0-9A-Fa-f]{64}$ ]] ||
+        die "Invalid SHA-256 file format: $checksum"
+
+    # Do NOT use `sha256sum -c` here. Detached checksum files often contain
+    # the original absolute path, which becomes stale after a backup is moved,
+    # copied, or mounted into a Docker container.
+    actual="$(sha256sum "$archive" | awk '{print $1}')"
+
+    log "Expected SHA-256: $expected"
+    log "Actual SHA-256:   $actual"
+
+    [[ "${expected,,}" == "${actual,,}" ]] ||
+        die "SHA-256 verification failed."
+
+    log "SHA-256: OK"
+}
+
+validate_tar_paths() {
+    local archive="$1"
+    local bad
+
+    bad="$(tar -tzf "$archive" | awk '
+        index($0, "\0") {next}
+        $0 ~ /^\// || $0 ~ /(^|\/)\.\.($|\/)/ {print; exit}
+    ')"
+    [[ -z "$bad" ]] || die "Unsafe path found in archive: $bad"
+}
 
 verify_archive() {
-    local checksum_file="${ARCHIVE}.sha256"
+    local checksum="${CHECKSUM_FILE:-${ARCHIVE}.sha256}"
 
-    log "Testing gzip integrity..."
-    if ! gzip -t "$ARCHIVE"; then
-        die "Gzip integrity check failed. Archive is corrupted."
-    fi
-    log "Gzip integrity: OK"
+    need_cmd gzip
+    need_cmd tar
+    need_cmd sha256sum
 
-    log "Testing tar archive structure..."
-    if ! tar -tzf "$ARCHIVE" >/dev/null; then
-        die "Tar archive is corrupt or unreadable."
-    fi
-    log "Tar archive structure: OK"
+    [[ -f "$ARCHIVE" ]] || die "Backup archive does not exist: $ARCHIVE"
+    [[ -r "$ARCHIVE" ]] || die "Backup archive is not readable: $ARCHIVE"
+    [[ -s "$ARCHIVE" ]] || die "Backup archive is empty: $ARCHIVE"
 
-    if [[ -f "$checksum_file" ]]; then
-        log "Verifying detached SHA-256 checksum..."
+    log "Archive: $ARCHIVE"
+    log "Checksum: $checksum"
+    log "Checking gzip integrity..."
+    gzip -t "$ARCHIVE" || die "gzip integrity check failed."
+    log "gzip integrity: OK"
 
-        (
-            cd "$(dirname "$ARCHIVE")"
-            sha256sum --strict --check "$(basename "$checksum_file")"
-        ) || die "Archive SHA-256 verification failed. Backup may be corrupted."
+    log "Checking tar structure..."
+    tar -tzf "$ARCHIVE" >/dev/null || die "tar archive is corrupt."
+    log "tar structure: OK"
 
-        log "Archive SHA-256: OK"
+    log "Checking archive paths..."
+    validate_tar_paths "$ARCHIVE"
+    log "Archive paths: OK"
+
+    if [[ -f "$checksum" ]]; then
+        log "Checking detached SHA-256..."
+        verify_sha256 "$ARCHIVE" "$checksum"
     else
-        warn "Detached SHA-256 checksum file not found: $checksum_file"
-
-        if ! prompt_yes_no "Continue without SHA-256 verification?" N; then
-            die "Restore aborted because checksum file is missing."
+        warn "Detached checksum not found: $checksum"
+        if [[ -t 0 ]]; then
+            read -r -p "Continue without detached SHA-256 verification? [y/N]: " ans
+            [[ "$ans" =~ ^[Yy]([Ee][Ss])?$ ]] ||
+                die "Restore aborted because checksum verification is unavailable."
+        else
+            die "Non-interactive restore requires $checksum."
         fi
     fi
 }
 
 extract_archive() {
-    mkdir -p "$RESTORE_ROOT"
-
     verify_archive
 
-    log "Extracting backup archive..."
-    tar --acls --xattrs --numeric-owner         -xzf "$ARCHIVE"         -C "$RESTORE_ROOT" ||
-        die "Backup archive extraction failed."
+    safe_mkdir "$RESTORE_ROOT" 0700
+    chmod 700 "$RESTORE_ROOT"
+    log "Extracting archive to: $RESTORE_ROOT"
+
+    tar --acls --xattrs --numeric-owner \
+        --no-same-owner \
+        -xzf "$ARCHIVE" -C "$RESTORE_ROOT" ||
+        die "Archive extraction failed."
 
     TREE="$RESTORE_ROOT/server-backup"
 
     [[ -d "$TREE" ]] ||
-        die "Invalid archive: missing server-backup directory."
+        die "Backup layout invalid: missing $TREE"
 
-    [[ -f "$TREE/backup-info.txt" ]] ||
-        warn "backup-info.txt not found; archive may be from an older backup version."
-
-    log "Archive extraction: OK"
+    log "Backup root: $TREE"
 }
 
-# -------------------------------------------------------------------
-# Helpers
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Backup layout inspection
+# ---------------------------------------------------------------------------
 
-backup_existing_dir() {
-    local path="$1"
-    local stamp="$2"
+show_backup_layout() {
+    log "Backup components detected:"
 
-    if [[ -e "$path" ]]; then
-        mv "$path" "${path}.before-restore-${stamp}"
-        printf '%s\n' "${path}.before-restore-${stamp}"
+    for d in \
+        WWW \
+        NGINX \
+        SECURITY \
+        SYSTEMD \
+        CROWDSEC \
+        POSTGRES \
+        MONGODB \
+        MSSQL \
+        DOCKER \
+        FIREWALL \
+        SSH
+    do
+        if [[ -e "$TREE/$d" ]]; then
+            log "  [FOUND] $d"
+        else
+            log "  [----]  $d"
+        fi
+    done
+}
+
+choose_restore_components() {
+    # Keep non-interactive runs deterministic. Interactive runs get the old
+    # component-selection workflow back, with safe defaults.
+    if [[ ! -t 0 || "${NONINTERACTIVE:-0}" == "1" ]]; then
+        log "Non-interactive mode: using configured restore component defaults."
+        return 0
+    fi
+
+    # Container-aware defaults.
+    if [[ "$SYSTEMD_AVAILABLE" != "1" ]]; then
+        RESTORE_SYSTEMD=0
+    fi
+    if [[ "$IN_CONTAINER" == "1" && "$DOCKER_SOCKET_AVAILABLE" != "1" ]]; then
+        RESTORE_DOCKER=0
+    fi
+
+    echo
+    echo "============================================================"
+    echo " Restore components"
+    echo "============================================================"
+    echo "Answer Y to restore, N to skip. Defaults are shown in [ ]"
+    echo
+
+    local ans
+    read -r -p "Restore /var/www? [Y/n]: " ans
+    [[ -z "$ans" || "$ans" =~ ^[Yy]$ ]] && RESTORE_WWW=1 || RESTORE_WWW=0
+
+    read -r -p "Restore Nginx? [Y/n]: " ans
+    [[ -z "$ans" || "$ans" =~ ^[Yy]$ ]] && RESTORE_NGINX=1 || RESTORE_NGINX=0
+
+    read -r -p "Restore PostgreSQL? [Y/n]: " ans
+    [[ -z "$ans" || "$ans" =~ ^[Yy]$ ]] && RESTORE_POSTGRES=1 || RESTORE_POSTGRES=0
+
+    read -r -p "Restore MongoDB? [Y/n]: " ans
+    [[ -z "$ans" || "$ans" =~ ^[Yy]$ ]] && RESTORE_MONGO=1 || RESTORE_MONGO=0
+
+    read -r -p "Restore MSSQL? [y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] && RESTORE_MSSQL=1 || RESTORE_MSSQL=0
+
+    if [[ "$SYSTEMD_AVAILABLE" == "1" ]]; then
+        read -r -p "Restore systemd units? [Y/n]: " ans
+        [[ -z "$ans" || "$ans" =~ ^[Yy]$ ]] && RESTORE_SYSTEMD=1 || RESTORE_SYSTEMD=0
+    else
+        RESTORE_SYSTEMD=0
+        log "systemd unavailable: systemd restore disabled."
+    fi
+
+    read -r -p "Restore CrowdSec config? [Y/n]: " ans
+    [[ -z "$ans" || "$ans" =~ ^[Yy]$ ]] && RESTORE_CROWDSEC=1 || RESTORE_CROWDSEC=0
+
+    if [[ "$IN_CONTAINER" == "1" && "$DOCKER_SOCKET_AVAILABLE" != "1" ]]; then
+        RESTORE_DOCKER=0
+        log "Docker container without Docker socket: Docker volume restore disabled."
+    else
+        read -r -p "Restore Docker volumes? [Y/n]: " ans
+        [[ -z "$ans" || "$ans" =~ ^[Yy]$ ]] && RESTORE_DOCKER=1 || RESTORE_DOCKER=0
+    fi
+
+    read -r -p "Restore firewall? [y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] && RESTORE_FIREWALL=1 || RESTORE_FIREWALL=0
+
+    read -r -p "Restore SSH configuration? [y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] && RESTORE_SSH=1 || RESTORE_SSH=0
+
+    echo
+    log "Selected restore components:"
+    log "  WWW=$RESTORE_WWW NGINX=$RESTORE_NGINX POSTGRES=$RESTORE_POSTGRES MONGO=$RESTORE_MONGO MSSQL=$RESTORE_MSSQL"
+    log "  SYSTEMD=$RESTORE_SYSTEMD CROWDSEC=$RESTORE_CROWDSEC DOCKER=$RESTORE_DOCKER FIREWALL=$RESTORE_FIREWALL SSH=$RESTORE_SSH"
+
+    read -r -p "Continue with these selections? [Y/n]: " ans
+    [[ -z "$ans" || "$ans" =~ ^[Yy]$ ]] || die "Restore cancelled by user."
+}
+
+validate_selected_backup() {
+    if [[ "$RESTORE_WWW" == 1 ]]; then
+        [[ -f "$TREE/WWW/var-www.tar.gz" ]] ||
+            warn "/var/www selected but backup file is absent."
+    fi
+
+    if [[ "$RESTORE_NGINX" == 1 ]]; then
+        [[ -d "$TREE/NGINX/etc-nginx" ]] ||
+            warn "Nginx selected but NGINX/etc-nginx is absent."
+    fi
+
+    if [[ "$RESTORE_POSTGRES" == 1 ]]; then
+        [[ -d "$TREE/POSTGRES" ]] ||
+            warn "PostgreSQL selected but POSTGRES directory is absent."
+    fi
+
+    if [[ "$RESTORE_MONGO" == 1 ]]; then
+        [[ -f "$TREE/MONGODB/mongodb.archive.gz" ]] ||
+            warn "MongoDB selected but mongodb.archive.gz is absent."
+    fi
+
+    if [[ "$RESTORE_MSSQL" == 1 ]]; then
+        [[ -d "$TREE/MSSQL/bak" ]] ||
+            warn "MSSQL selected but MSSQL/bak is absent."
     fi
 }
 
-restore_tree_dir() {
-    local source="$1"
-    local destination="$2"
+# ---------------------------------------------------------------------------
+# APT repository management
+# ---------------------------------------------------------------------------
 
-    mkdir -p "$destination"
-    cp -a "$source/." "$destination/"
+apt_disable_conflicting_sources() {
+    local f backup_dir backup base stamp
+    [[ "$PACKAGE_MANAGER" == "apt" ]] || return 0
+
+    # Never rename a source file to *.restore-disabled inside sources.list.d:
+    # APT scans that directory and emits noisy "invalid filename extension"
+    # warnings. Store disabled sources outside APT's source directories.
+    backup_dir="/var/lib/server-restore/apt-disabled/$(date +%Y%m%d_%H%M%S)-$$"
+    safe_mkdir "$backup_dir" 0700
+
+    while IFS= read -r -d '' f; do
+        case "$f" in
+            *.restore-disabled|*.restore-disabled.*) continue ;;
+        esac
+        if grep -qiE 'packages\.microsoft\.com' "$f" 2>/dev/null; then
+            base="$(basename "$f")"
+            backup="$backup_dir/$base"
+            mv -f -- "$f" "$backup" || die "Could not disable Microsoft APT source: $f"
+            APT_DISABLED+=("$backup::$f")
+            log "Temporarily disabled Microsoft source: $f"
+        fi
+    done < <(
+        find /etc/apt/sources.list.d -maxdepth 1 -type f \
+            \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null || true
+    )
+
+    # Do not move /etc/apt/sources.list as a whole. It normally contains
+    # Ubuntu/Debian official repositories in addition to any third-party lines.
+    if [[ -f /etc/apt/sources.list ]] && grep -qiE 'packages\.microsoft\.com' /etc/apt/sources.list; then
+        warn "Microsoft repository is embedded in /etc/apt/sources.list; leaving it untouched to avoid disabling Ubuntu repositories."
+    fi
 }
 
-# -------------------------------------------------------------------
-# WWW
-# -------------------------------------------------------------------
+apt_restore_sources() {
+    local entry backup original
+    for entry in "${APT_DISABLED[@]:-}"; do
+        [[ "$entry" == *::* ]] || continue
+        backup="${entry%%::*}"
+        original="${entry#*::}"
+        [[ -f "$backup" ]] || continue
+
+        if [[ -e "$original" ]]; then
+            log "Keeping disabled legacy Microsoft source disabled because a replacement exists: $original"
+            continue
+        fi
+
+        # If the script installed a current Microsoft repository elsewhere,
+        # leave the old conflicting source disabled.
+        if find /etc/apt/sources.list.d -maxdepth 1 -type f \
+            \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null |
+            xargs -0 -r grep -lqiE 'packages\.microsoft\.com'; then
+            log "Keeping disabled legacy Microsoft source disabled because an active Microsoft repository exists."
+            continue
+        fi
+
+        safe_mkdir "$(dirname "$original")" 0755
+        mv -f -- "$backup" "$original" ||
+            warn "Could not restore APT source: $original"
+    done
+    APT_DISABLED=()
+}
+
+# ---------------------------------------------------------------------------
+# Package installation
+# ---------------------------------------------------------------------------
+
+install_base_tools_apt() {
+    apt-get update
+    apt-get install -y \
+        ca-certificates curl gnupg \
+        tar gzip coreutils rsync \
+        openssl
+}
+
+install_postgres_ubuntu_official() {
+    local version="${PG_VERSION:-18}"
+    local key="/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc"
+    local repo="/etc/apt/sources.list.d/pgdg.sources"
+
+    log "PostgreSQL: configuring official PGDG repository."
+
+    apt-get install -y postgresql-common
+    install -d -m 0755 /usr/share/postgresql-common/pgdg
+
+    curl -fsSL \
+        -o "$key" \
+        https://www.postgresql.org/media/keys/ACCC4CF8.asc
+
+    chmod 0644 "$key"
+
+    local pg_arch
+    case "$ARCH" in
+        amd64|arm64) pg_arch="$ARCH" ;;
+        *) die "Unsupported PostgreSQL PGDG architecture: $ARCH" ;;
+    esac
+
+    cat > "$repo" <<EOF
+Types: deb
+URIs: https://apt.postgresql.org/pub/repos/apt
+Suites: ${OS_CODENAME}-pgdg
+Architectures: ${pg_arch}
+Components: main
+Signed-By: ${key}
+EOF
+
+    chmod 0644 "$repo"
+
+    apt-get update
+    apt-get install -y "postgresql-${version}" "postgresql-client-${version}"
+}
+
+install_postgres() {
+    if have_cmd psql && have_cmd pg_restore; then
+        log "PostgreSQL client tools already available."
+    elif [[ "$PACKAGE_MANAGER" == "apt" ]]; then
+        if apt-cache show postgresql >/dev/null 2>&1; then
+            apt-get update
+            apt-get install -y postgresql postgresql-client
+        else
+            install_postgres_ubuntu_official
+        fi
+    elif [[ "$PACKAGE_MANAGER" == "pacman" ]]; then
+        pacman -S --noconfirm --needed postgresql
+    else
+        die "Cannot install PostgreSQL on this OS."
+    fi
+
+    have_cmd psql || die "psql installation failed."
+    have_cmd pg_restore || die "pg_restore installation failed."
+}
+
+install_mongodb_ubuntu_official() {
+    local key="/usr/share/keyrings/mongodb-server-8.0.gpg"
+    local list="/etc/apt/sources.list.d/mongodb-org-8.0.list"
+
+    [[ "$OS_ID" == "ubuntu" ]] ||
+        die "MongoDB automatic repository installation is only implemented for supported Ubuntu releases."
+
+    case "$OS_CODENAME" in
+        noble|jammy|focal) ;;
+        *) die "MongoDB 8.0 official Ubuntu repository does not support codename: $OS_CODENAME" ;;
+    esac
+
+    log "MongoDB: configuring official MongoDB 8.0 repository."
+
+    apt-get install -y gnupg curl
+    install -d -m 0755 /usr/share/keyrings
+
+    curl -fsSL https://pgp.mongodb.com/server-8.0.asc |
+        gpg --dearmor --yes -o "$key"
+
+    chmod 0644 "$key"
+
+    local mongo_arch
+    case "$ARCH" in
+        amd64) mongo_arch=amd64 ;;
+        arm64) mongo_arch=arm64 ;;
+        *) die "Unsupported MongoDB architecture: $ARCH" ;;
+    esac
+
+    cat > "$list" <<EOF
+deb [ arch=${mongo_arch} signed-by=${key} ] https://repo.mongodb.org/apt/ubuntu ${OS_CODENAME}/mongodb-org/8.0 multiverse
+EOF
+
+    chmod 0644 "$list"
+
+    apt-get update
+    apt-get install -y mongodb-org
+}
+
+install_mongodb() {
+    if have_cmd mongorestore; then
+        log "MongoDB Database Tools already available."
+    elif [[ "$PACKAGE_MANAGER" == "apt" && "$OS_ID" == "ubuntu" ]]; then
+        install_mongodb_ubuntu_official
+    elif [[ "$PACKAGE_MANAGER" == "pacman" ]]; then
+        # Arch does not provide MongoDB Community from the official Arch
+        # repositories. Do not silently install an unrelated package.
+        die "MongoDB is not installed on Arch. Install MongoDB Community using MongoDB's supported Linux package/tarball method, then rerun."
+    else
+        die "No supported official MongoDB installation path for $OS_ID."
+    fi
+
+    have_cmd mongorestore || die "mongorestore installation failed."
+}
+
+install_mssql_ubuntu_official() {
+    local repo="/etc/apt/sources.list.d/mssql-server-restore.list"
+    local key="/usr/share/keyrings/microsoft-prod.gpg"
+
+    [[ "$OS_ID" == "ubuntu" ]] ||
+        die "Microsoft SQL Server automatic installation is supported here only on Ubuntu."
+
+    case "$OS_VERSION" in
+        24.04)
+            log "MSSQL: using Microsoft SQL Server 2025 repository for Ubuntu 24.04."
+            curl -fsSL \
+                https://packages.microsoft.com/config/ubuntu/24.04/mssql-server-2025.list \
+                -o "$repo"
+            ;;
+        22.04)
+            log "MSSQL: using Microsoft SQL Server 2022 repository for Ubuntu 22.04."
+            curl -fsSL \
+                https://packages.microsoft.com/config/ubuntu/22.04/mssql-server-2022.list \
+                -o "$repo"
+            ;;
+        20.04)
+            log "MSSQL: using Microsoft SQL Server 2022 repository for Ubuntu 20.04."
+            curl -fsSL \
+                https://packages.microsoft.com/config/ubuntu/20.04/mssql-server-2022.list \
+                -o "$repo"
+            ;;
+        *)
+            die "No supported Microsoft SQL Server repository mapping for Ubuntu $OS_VERSION."
+            ;;
+    esac
+
+    install -d -m 0755 /usr/share/keyrings
+
+    curl -fsSL https://packages.microsoft.com/keys/microsoft.asc |
+        gpg --dearmor --yes -o "$key"
+
+    chmod 0644 "$key"
+    chmod 0644 "$repo"
+
+    apt-get update
+    apt-get install -y mssql-server
+
+    # Microsoft currently documents the packages-microsoft-prod.deb bootstrap
+    # for mssql-tools18 on Ubuntu 24.04. Use it instead of leaving a second
+    # manually-managed prod.list behind.
+    local repo_deb="/var/tmp/packages-microsoft-prod.deb"
+    curl -fsSL \
+        "https://packages.microsoft.com/config/ubuntu/${OS_VERSION}/packages-microsoft-prod.deb" \
+        -o "$repo_deb"
+    dpkg -i "$repo_deb" >/dev/null
+    rm -f -- "$repo_deb"
+
+    apt-get update
+    ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
+
+    if [[ -x /opt/mssql-tools18/bin/sqlcmd ]]; then
+        ln -sf /opt/mssql-tools18/bin/sqlcmd /usr/local/bin/sqlcmd
+    fi
+
+    [[ -x /opt/mssql/bin/mssql-conf ]] ||
+        die "mssql-conf not installed."
+
+    have_cmd sqlcmd ||
+        die "sqlcmd not installed."
+}
+
+install_mssql() {
+    if [[ -x /opt/mssql/bin/mssql-conf ]] && have_cmd sqlcmd; then
+        log "MSSQL server/tools already installed."
+        return
+    fi
+
+    install_mssql_ubuntu_official
+}
+
+install_selected_packages() {
+    log "Installing required restore software..."
+
+    case "$PACKAGE_MANAGER" in
+        apt)
+            export DEBIAN_FRONTEND=noninteractive
+            apt_disable_conflicting_sources
+            install_base_tools_apt
+
+            if [[ "$RESTORE_NGINX" == 1 ]]; then
+                apt-get install -y nginx
+            fi
+
+            if [[ "$RESTORE_POSTGRES" == 1 ]]; then
+                install_postgres
+            fi
+
+            if [[ "$RESTORE_MONGO" == 1 ]]; then
+                install_mongodb
+            fi
+
+            if [[ "$RESTORE_MSSQL" == 1 ]]; then
+                install_mssql
+            fi
+
+            if [[ "$RESTORE_DOCKER" == 1 ]]; then
+                if (( IN_CONTAINER == 1 && DOCKER_SOCKET_AVAILABLE == 0 )); then
+                    warn "Docker restore requested, but running inside a container without a Docker socket; Docker daemon package will not be installed."
+                else
+                    apt-get install -y docker.io
+                fi
+            fi
+
+            if [[ "$RESTORE_SSH" == 1 ]]; then
+                apt-get install -y openssh-server
+            fi
+
+            if [[ "$RESTORE_FIREWALL" == 1 ]]; then
+                apt-get install -y ufw iptables nftables
+            fi
+            ;;
+        pacman)
+            pacman -Sy --noconfirm --needed \
+                ca-certificates curl tar gzip rsync
+
+            if [[ "$RESTORE_NGINX" == 1 ]]; then
+                pacman -S --noconfirm --needed nginx
+            fi
+
+            if [[ "$RESTORE_POSTGRES" == 1 ]]; then
+                install_postgres
+            fi
+
+            if [[ "$RESTORE_MONGO" == 1 ]]; then
+                install_mongodb
+            fi
+
+            if [[ "$RESTORE_MSSQL" == 1 ]]; then
+                die "Microsoft SQL Server Linux is not installed from Arch official repositories. Use a supported Ubuntu host/package for automatic MSSQL recovery."
+            fi
+
+            if [[ "$RESTORE_DOCKER" == 1 ]]; then
+                if (( IN_CONTAINER == 1 && DOCKER_SOCKET_AVAILABLE == 0 )); then
+                    warn "Docker restore requested, but no Docker socket is available inside this container."
+                else
+                    pacman -S --noconfirm --needed docker
+                fi
+            fi
+
+            if [[ "$RESTORE_SSH" == 1 ]]; then
+                pacman -S --noconfirm --needed openssh
+            fi
+            ;;
+    esac
+
+    apt_restore_sources
+}
+
+# ---------------------------------------------------------------------------
+# /var/www
+# ---------------------------------------------------------------------------
 
 restore_www() {
     [[ "$RESTORE_WWW" == 1 ]] || return 0
     [[ -f "$TREE/WWW/var-www.tar.gz" ]] || {
-        warn "WWW backup not found; skipping /var/www."
-        return 0
+        warn "Skipping /var/www: backup component not present."
+        return
     }
 
-    log "[1] Restoring /var/www"
+    log "[1/11] Restoring /var/www"
 
-    local old
-    old="/var/www.before-restore-$(date +%Y%m%d_%H%M%S)"
+    local stage="$RESTORE_ROOT/stage/www"
+    local old="/var/www.before-restore-$(date +%Y%m%d_%H%M%S)"
 
-    if [[ -d /var/www ]]; then
-        mv /var/www "$old"
+    rm -rf "$stage"
+    safe_mkdir "$stage" 0700
+
+    tar --acls --xattrs --numeric-owner \
+        -xzf "$TREE/WWW/var-www.tar.gz" -C "$stage" ||
+        die "/var/www archive extraction failed."
+
+    # Accept the two common backup layouts:
+    #   1) archive contains var/www/... (created from /)
+    #   2) archive contains the contents of /var/www directly
+    local source_dir=""
+    if [[ -d "$stage/var/www" ]]; then
+        source_dir="$stage/var/www"
+    elif [[ -d "$stage/www" && ! -d "$stage/var" ]]; then
+        source_dir="$stage/www"
+    else
+        # Direct-content layout is valid if extraction produced at least one
+        # file/directory and did not contain an unexpected top-level tree.
+        if find "$stage" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+            source_dir="$stage"
+        fi
     fi
 
-    mkdir -p /var/www
+    [[ -n "$source_dir" && -d "$source_dir" ]] ||
+        die "WWW archive layout invalid: expected var/www or direct /var/www contents."
 
-    if ! tar --acls --xattrs --numeric-owner \
-        -xzf "$TREE/WWW/var-www.tar.gz" -C /var; then
-        rm -rf /var/www
-        [[ -d "$old" ]] && mv "$old" /var/www
-        die "/var/www restore failed. Original directory restored."
+    local new_www="$RESTORE_ROOT/stage/www-activated"
+    rm -rf "$new_www"
+    safe_mkdir "$new_www" 0755
+    restore_copy "$source_dir" "$new_www"
+
+    if [[ -e /var/www || -L /var/www ]]; then
+        mv /var/www "$old" ||
+            die "Could not move existing /var/www to $old"
     fi
 
-    log "/var/www restored successfully."
+    mv "$new_www" /var/www || {
+        [[ -e "$old" ]] && mv "$old" /var/www || true
+        die "Could not activate restored /var/www; previous /var/www was restored."
+    }
+    chown root:root /var/www
+    chmod 755 /var/www
+
+    log "/var/www restored. Previous copy: $old"
 }
 
-# -------------------------------------------------------------------
-# Let's Encrypt
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Let's Encrypt / Nginx
+# ---------------------------------------------------------------------------
 
 restore_letsencrypt() {
     [[ "$RESTORE_NGINX" == 1 ]] || return 0
     [[ -d "$TREE/SECURITY/etc-letsencrypt" ]] || {
-        warn "Backup does not contain /etc/letsencrypt."
-        return 0
+        warn "Let's Encrypt backup not present."
+        return
     }
 
-    log "[2] Restoring Let's Encrypt / SSL configuration"
+    log "[2/11] Restoring Let's Encrypt"
 
-    local old
-    old="/etc/letsencrypt.before-restore-$(date +%Y%m%d_%H%M%S)"
+    local stage="$RESTORE_ROOT/stage/letsencrypt"
+    local old="/etc/letsencrypt.before-restore-$(date +%Y%m%d_%H%M%S)"
 
-    if [[ -d /etc/letsencrypt ]]; then
+    rm -rf "$stage"
+    safe_mkdir "$stage" 0700
+
+    restore_copy "$TREE/SECURITY/etc-letsencrypt" "$stage"
+
+    if [[ -e /etc/letsencrypt ]]; then
         mv /etc/letsencrypt "$old"
     fi
 
-    mkdir -p /etc/letsencrypt
-    cp -a "$TREE/SECURITY/etc-letsencrypt/." /etc/letsencrypt/
+    mv "$stage" /etc/letsencrypt
+    chown -R root:root /etc/letsencrypt
+    chmod 700 /etc/letsencrypt
 
-    chmod 700 /etc/letsencrypt 2>/dev/null || true
-
-    # Save old location for Nginx rollback.
-    LETSENCRYPT_OLD="$old"
-    log "Let's Encrypt configuration restored."
+    log "Let's Encrypt restored. Previous copy: $old"
 }
 
-# -------------------------------------------------------------------
-# Nginx with actual rollback
-# -------------------------------------------------------------------
+normalize_nginx_http2() {
+    # Nginx 1.25.1+ supports the standalone `http2 on;` directive.
+    # Older Nginx (including Ubuntu 24.04's common 1.24.x package) uses:
+    #     listen 443 ssl http2;
+    # Therefore NEVER convert the old syntax on an older Nginx binary.
+    local nginx_version major minor patch file tmp
+
+    nginx_version="$(nginx -v 2>&1 | sed -n 's#^nginx version: nginx/##p' | head -n1)"
+    [[ -n "$nginx_version" ]] || {
+        warn "Could not determine Nginx version; leaving HTTP/2 syntax unchanged."
+        return 0
+    }
+
+    major="${nginx_version%%.*}"
+    local rest="${nginx_version#*.}"
+    minor="${rest%%.*}"
+    patch="${rest#*.}"
+    patch="${patch%%[^0-9]*}"
+    patch="${patch:-0}"
+
+    log "Nginx version detected: $nginx_version"
+
+    # Standalone `http2 on;` is supported from 1.25.1.
+    if (( major > 1 || (major == 1 && minor > 25) ||
+          (major == 1 && minor == 25 && patch >= 1) )); then
+        while IFS= read -r -d '' file; do
+            if grep -Eq '^[[:space:]]*listen[[:space:]].*[[:space:]]http2[[:space:]]*;' "$file"; then
+                tmp="${file}.tmp.$$"
+
+                awk '
+                BEGIN { inserted=0 }
+                {
+                    line=$0
+                    if (line !~ /^[[:space:]]*#/ &&
+                        line ~ /^[[:space:]]*listen[[:space:]].*[[:space:]]http2[[:space:]]*;/) {
+                        sub(/[[:space:]]+http2[[:space:]]*;/, ";", line)
+                        print line
+                        if (!inserted) {
+                            print "    http2 on;"
+                            inserted=1
+                        }
+                    } else {
+                        print line
+                    }
+                }' "$file" > "$tmp" || die "Failed editing Nginx file: $file"
+
+                cat "$tmp" > "$file"
+                rm -f "$tmp"
+                log "Nginx: converted deprecated listen ... http2 syntax in $file (Nginx $nginx_version)"
+            fi
+        done < <(find /etc/nginx -type f -print0 2>/dev/null)
+    else
+        log "Nginx $nginx_version uses legacy listen ... http2 syntax; leaving it unchanged."
+    fi
+}
 
 restore_nginx() {
     [[ "$RESTORE_NGINX" == 1 ]] || return 0
     [[ -d "$TREE/NGINX/etc-nginx" ]] || {
-        warn "Nginx configuration not present in backup."
-        return 0
+        warn "Nginx backup not present."
+        return
     }
 
-    log "[3] Restoring Nginx configuration"
+    log "[3/11] Restoring Nginx"
 
-    systemctl stop nginx 2>/dev/null || true
+    local stage="$RESTORE_ROOT/stage/nginx"
+    local old="/etc/nginx.before-restore-$(date +%Y%m%d_%H%M%S)"
 
-    local stamp
-    stamp="$(date +%Y%m%d_%H%M%S)"
+    rm -rf "$stage"
+    safe_mkdir "$stage" 0700
 
-    local old_nginx="/etc/nginx.before-restore-${stamp}"
+    restore_copy "$TREE/NGINX/etc-nginx" "$stage"
 
-    if [[ -d /etc/nginx ]]; then
-        mv /etc/nginx "$old_nginx"
+    if systemd_usable; then
+        systemctl stop nginx 2>/dev/null || true
+    else
+        pkill -TERM -x nginx 2>/dev/null || true
     fi
 
-    mkdir -p /etc/nginx
-    cp -a "$TREE/NGINX/etc-nginx/." /etc/nginx/
+    if [[ -e /etc/nginx ]]; then
+        mv /etc/nginx "$old"
+    fi
 
-    log "Testing restored Nginx configuration..."
+    mv "$stage" /etc/nginx
+    chown -R root:root /etc/nginx
+    chmod 755 /etc/nginx
 
-    if nginx -t; then
-        log "Nginx configuration test: OK"
+    normalize_nginx_http2
 
-        systemctl enable nginx >/dev/null 2>&1 || true
-
-        if systemctl restart nginx; then
-            log "Nginx restarted successfully."
-
-            # Old config is intentionally retained for manual rollback.
-            return 0
+    if ! nginx -t; then
+        log "Nginx validation failed. Rolling back."
+        rm -rf /etc/nginx
+        [[ -d "$old" ]] && mv "$old" /etc/nginx
+        if systemd_usable; then
+            systemctl start nginx 2>/dev/null || true
+        else
+            nginx >/dev/null 2>&1 || true
         fi
+        die "Nginx restore failed; previous configuration restored."
+    fi
 
-        warn "Nginx restart failed; rolling back."
+    if systemd_usable; then
+        service_start nginx || die "Nginx failed to start after successful configuration validation."
     else
-        warn "Nginx configuration test failed; rolling back."
+        nginx >/dev/null 2>&1 || die "Nginx failed to start in systemd-less environment."
     fi
 
-    # ----------------------------------------------------------------
-    # Actual rollback
-    # ----------------------------------------------------------------
-    rm -rf /etc/nginx
-
-    if [[ -d "$old_nginx" ]]; then
-        mv "$old_nginx" /etc/nginx
-    else
-        mkdir -p /etc/nginx
-    fi
-
-    # Restore previous Let's Encrypt directory if this restore replaced it.
-    if [[ -n "${LETSENCRYPT_OLD:-}" && -d "$LETSENCRYPT_OLD" ]]; then
-        rm -rf /etc/letsencrypt
-        mv "$LETSENCRYPT_OLD" /etc/letsencrypt
-    fi
-
-    nginx -t || true
-    systemctl start nginx 2>/dev/null || true
-
-    die "Nginx restore failed. Previous Nginx/SSL configuration was rolled back."
+    log "Nginx restored and running. Previous copy: $old"
 }
 
-# -------------------------------------------------------------------
-# systemd
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# systemd / CrowdSec
+# ---------------------------------------------------------------------------
 
 restore_systemd() {
     [[ "$RESTORE_SYSTEMD" == 1 ]] || return 0
 
-    local restored=0
+    log "[4/11] Restoring systemd units"
+
+    if ! systemd_usable; then
+        warn "systemd is not available in this environment; systemd unit restore is skipped."
+        return 0
+    fi
 
     if [[ -d "$TREE/SYSTEMD/etc-systemd-system" ]]; then
-        log "[4] Restoring systemd system units"
-        mkdir -p /etc/systemd/system
-        cp -a "$TREE/SYSTEMD/etc-systemd-system/." /etc/systemd/system/
-        restored=1
+        restore_copy \
+            "$TREE/SYSTEMD/etc-systemd-system" \
+            /etc/systemd/system
     fi
 
     if [[ -d "$TREE/SYSTEMD/etc-systemd-user" ]]; then
-        log "Restoring systemd user units"
-        mkdir -p /etc/systemd/user
-        cp -a "$TREE/SYSTEMD/etc-systemd-user/." /etc/systemd/user/
-        restored=1
+        restore_copy \
+            "$TREE/SYSTEMD/etc-systemd-user" \
+            /etc/systemd/user
     fi
 
-    if ((restored)); then
-        systemctl daemon-reload
-        log "systemd units restored."
-    fi
+    systemctl daemon-reload
+    log "systemd units restored."
 }
-
-# -------------------------------------------------------------------
-# CrowdSec
-# -------------------------------------------------------------------
 
 restore_crowdsec() {
     [[ "$RESTORE_CROWDSEC" == 1 ]] || return 0
-    [[ -d "$TREE/CROWDSEC/etc-crowdsec" ]] || return 0
+    [[ -d "$TREE/CROWDSEC/etc-crowdsec" ]] || {
+        warn "CrowdSec backup not present."
+        return
+    }
 
-    log "[5] Restoring CrowdSec configuration"
-
-    systemctl stop crowdsec 2>/dev/null || true
+    log "[5/11] Restoring CrowdSec configuration"
 
     local old="/etc/crowdsec.before-restore-$(date +%Y%m%d_%H%M%S)"
 
-    if [[ -d /etc/crowdsec ]]; then
+    if systemd_usable; then
+        systemctl stop crowdsec 2>/dev/null || true
+    fi
+
+    if [[ -e /etc/crowdsec ]]; then
         mv /etc/crowdsec "$old"
     fi
 
-    mkdir -p /etc/crowdsec
-    cp -a "$TREE/CROWDSEC/etc-crowdsec/." /etc/crowdsec/
+    restore_copy "$TREE/CROWDSEC/etc-crowdsec" /etc/crowdsec
+    chown -R root:root /etc/crowdsec
 
-    systemctl daemon-reload
-
-    if systemctl is-enabled crowdsec >/dev/null 2>&1 ||
-       systemctl list-unit-files crowdsec.service >/dev/null 2>&1; then
-        systemctl enable crowdsec 2>/dev/null || true
-        systemctl start crowdsec || {
-            warn "CrowdSec failed to start. Previous config: $old"
-        }
+    if systemd_usable && unit_exists crowdsec.service; then
+        systemctl enable crowdsec >/dev/null 2>&1 || true
+        systemctl start crowdsec || warn "CrowdSec did not start. Previous config: $old"
+    else
+        warn "CrowdSec service start skipped because systemd is unavailable or unit is missing."
     fi
 }
 
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # PostgreSQL
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
-sql_ident_escape() {
-    local value="$1"
-    printf '%s' "${value//\"/\"\"}"
+pg_sql_ident() {
+    local s="$1"
+    printf '%s' "${s//\"/\"\"}"
 }
 
-sql_literal_escape() {
-    local value="$1"
-    printf '%s' "${value//\'/\'\'}"
+pg_sql_literal() {
+    local s="$1"
+    printf '%s' "${s//\'/\'\'}"
 }
 
-restore_postgres_globals_prepare() {
+pg_prepare_globals() {
     local input="$1"
-    local output="$RESTORE_ROOT/POSTGRES/globals.restore.sql"
-    local line decl role_name
-    local -a existing_roles=()
-    declare -A existing_role_map=()
+    local output="$2"
 
-    while IFS= read -r role_name; do
-        [[ -n "$role_name" ]] || continue
-        existing_role_map["$role_name"]=1
-    done < <(
-        runuser -u postgres -- psql -Atqc "SELECT rolname FROM pg_roles;"
-    )
+    verify_file "$input"
+    safe_mkdir "$(dirname "$output")" 0700
+
+    local roles_file="$RESTORE_ROOT/pg-existing-roles.txt"
+
+    run_as postgres psql -Atqc \
+        "SELECT rolname FROM pg_roles;" > "$roles_file" ||
+        die "PostgreSQL: could not query existing roles."
+
+    declare -A existing=()
+    local role
+
+    while IFS= read -r role; do
+        [[ -n "$role" ]] && existing["$role"]=1
+    done < "$roles_file"
 
     : > "$output"
 
+    local line decl role_name
     local create_role_re='^CREATE[[:space:]]+ROLE[[:space:]]+(.+);[[:space:]]*$'
 
     while IFS= read -r line || [[ -n "$line" ]]; do
-        if [[ "$line" =~ $create_role_re ]]; then
-            decl="${BASH_REMATCH[1]}"
-            role_name="$decl"
 
-            # pg_dumpall normally emits CREATE ROLE <identifier>;
-            # support both quoted and unquoted identifiers here.
-            if [[ "${role_name:0:1}" == '"' && "${role_name: -1}" == '"' ]]; then
-                role_name="${role_name:1:${#role_name}-2}"
-                role_name="$(printf '%s' "$role_name" | sed 's/""/"/g')"
-            fi
+    # Protect native PostgreSQL recovery account.
+    #
+    # Example:
+    # ALTER ROLE postgres WITH SUPERUSER INHERIT CREATEROLE CREATEDB NOLOGIN REPLICATION BYPASSRLS;
+    #
+    # becomes:
+    # ALTER ROLE postgres WITH SUPERUSER INHERIT CREATEROLE CREATEDB LOGIN REPLICATION BYPASSRLS;
 
-            if [[ -n "${existing_role_map[$role_name]+x}" ]]; then
-                printf '%s\n' "-- RESTORE SKIPPED: role '$role_name' already exists."
-            else
-                printf '%s\n' "$line"
-            fi
-        else
-            printf '%s\n' "$line"
+    if [[ "$line" == ALTER\ ROLE\ postgres* ]] ||
+       [[ "$line" == ALTER\ ROLE\ \"postgres\"* ]]; then
+
+        if [[ "$line" == *NOLOGIN* ]]; then
+            log "PostgreSQL: protecting native recovery role from NOLOGIN:"
+            log "  $line"
+
+            line="${line//NOLOGIN/LOGIN}"
+
+            log "PostgreSQL: protected statement:"
+            log "  $line"
         fi
-    done < "$input" > "$output"
+    fi
+
+    # Existing-role handling
+    if [[ "$line" =~ $create_role_re ]]; then
+
+        decl="${BASH_REMATCH[1]}"
+
+        if [[ "${decl:0:1}" == '"' ]]; then
+            role_name="$(
+                printf '%s\n' "$decl" |
+                    sed -E 's/^"(([^"]|"")*)".*/\1/'
+            )"
+
+            role_name="${role_name//\"\"/\"}"
+
+        else
+            role_name="${decl%%[[:space:]]*}"
+            role_name="${role_name%;}"
+        fi
+
+        if [[ -n "${existing[$role_name]+yes}" ]]; then
+            printf -- \
+                '-- RESTORE-SKIPPED existing role: %s\n' \
+                "$role_name" >> "$output"
+        else
+            printf '%s\n' "$line" >> "$output"
+        fi
+
+    else
+        printf '%s\n' "$line" >> "$output"
+    fi
+
+done < "$input"
+
+    # ================================================================
+    # FINAL SAFETY NET
+    # ================================================================
+    #
+    # Even if pg_dumpall contains an unusual ALTER ROLE postgres statement,
+    # the native recovery account must finish with LOGIN + SUPERUSER.
+    #
+    # This is intentionally ONLY for postgres.
+    # ================================================================
+
+    cat >> "$output" <<'SQL'
+
+-- ================================================================
+-- RESTORE SAFETY: native PostgreSQL recovery account
+-- ================================================================
+
+ALTER ROLE postgres LOGIN;
+ALTER ROLE postgres SUPERUSER;
+
+SQL
 
     chown postgres:postgres "$output"
     chmod 600 "$output"
-    printf '%s\n' "$output"
+
+    [[ -s "$output" ]] ||
+        die "Prepared PostgreSQL globals file is empty."
+
+    log "PostgreSQL globals prepared: $output"
 }
 
-set_new_postgres_password() {
-    local pg_user="$1"
-    local p1 p2
+pg_drop_create_database() {
+    local db="$1"
+    local ident
+    ident="$(pg_sql_ident "$db")"
 
-    echo
-    echo "PostgreSQL '$pg_user' password can be replaced with a new password."
-    echo "This is useful on a fresh disaster-recovery server because the old password may be unknown."
+    if run_as postgres psql -Atqc \
+        "SELECT 1 FROM pg_database WHERE datname='$(pg_sql_literal "$db")';" \
+        | grep -qx 1; then
 
-    while true; do
-        read -r -s -p "New PostgreSQL password for '$pg_user': " p1
-        echo
-        read -r -s -p "Confirm PostgreSQL password: " p2
-        echo
+        log "PostgreSQL: dropping existing database: $db"
 
-        [[ -n "$p1" ]] || { warn "PostgreSQL password cannot be empty."; continue; }
-        [[ "$p1" == "$p2" ]] || { warn "PostgreSQL passwords do not match."; continue; }
+        if ! run_as postgres psql -v ON_ERROR_STOP=1 -c \
+            "DROP DATABASE \"$ident\" WITH (FORCE);" 2>/dev/null; then
+            run_as postgres psql -v ON_ERROR_STOP=1 -c \
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$(pg_sql_literal "$db")';" \
+                >/dev/null || true
 
-        runuser -u postgres -- psql -v ON_ERROR_STOP=1 \
-            -c "ALTER ROLE $(sql_ident_escape "$pg_user") PASSWORD '$(sql_literal_escape "$p1")';" \
-            && break
+            run_as postgres psql -v ON_ERROR_STOP=1 -c \
+                "DROP DATABASE \"$ident\";" ||
+                die "Could not drop PostgreSQL database: $db"
+        fi
+    fi
 
-        warn "PostgreSQL password change failed. Try again."
-    done
+    run_as postgres psql -v ON_ERROR_STOP=1 -c \
+        "CREATE DATABASE \"$ident\";" ||
+        die "Could not create PostgreSQL database: $db"
+}
 
-    unset p1 p2
-    log "PostgreSQL: new password configured successfully for '$pg_user'."
+start_postgres() {
+    log "PostgreSQL: starting database service/cluster..."
+
+    if systemd_usable && unit_exists postgresql.service; then
+        if service_start postgresql; then
+            PG_SERVICE="postgresql"
+            return 0
+        fi
+        warn "systemd PostgreSQL start failed; trying cluster-level startup."
+    fi
+
+    # Debian/Ubuntu uses pg_lsclusters + pg_ctlcluster. This is the preferred
+    # systemd-less/container path. pg_lsclusters columns are:
+    # version cluster port status owner datadir logfile
+    if have_cmd pg_lsclusters && have_cmd pg_ctlcluster; then
+        local version cluster port status owner datadir logfile
+        while IFS=" " read -r version cluster port status owner datadir logfile; do
+            [[ -n "$version" && -n "$cluster" ]] || continue
+            [[ "$version" =~ ^[0-9]+$ ]] || continue
+
+            if [[ "$status" != "online" ]]; then
+                log "PostgreSQL: cluster $version/$cluster on port $port is $status; starting..."
+                if ! pg_ctlcluster --skip-systemctl-redirect "$version" "$cluster" start; then
+                    warn "Could not start PostgreSQL cluster $version/$cluster with pg_ctlcluster."
+                    continue
+                fi
+            fi
+
+            if have_cmd pg_isready && pg_isready -h 127.0.0.1 -p "$port" >/dev/null 2>&1; then
+                PG_SERVICE="${version}/${cluster}"
+                log "PostgreSQL: cluster $version/$cluster is ready on port $port."
+                return 0
+            fi
+
+            # pg_ctlcluster status is useful even when pg_isready is unavailable.
+            if pg_ctlcluster --skip-systemctl-redirect "$version" "$cluster" status >/dev/null 2>&1; then
+                PG_SERVICE="${version}/${cluster}"
+                return 0
+            fi
+        done < <(pg_lsclusters --no-header 2>/dev/null || true)
+    fi
+
+    # Generic fallback for installations without Debian cluster tooling.
+    if have_cmd pg_ctl; then
+        local datadir
+        datadir="$(find /var/lib/postgresql -mindepth 2 -maxdepth 3 -type f -name PG_VERSION -printf '%h\n' 2>/dev/null | head -n1 || true)"
+        if [[ -n "$datadir" ]]; then
+            log "PostgreSQL: starting data directory directly: $datadir"
+            run_as postgres pg_ctl -D "$datadir" -w start || true
+            if run_as postgres pg_ctl -D "$datadir" status >/dev/null 2>&1; then
+                PG_SERVICE="$datadir"
+                return 0
+            fi
+        fi
+    fi
+
+    if have_cmd pg_isready && pg_isready -h 127.0.0.1 -p 5432 >/dev/null 2>&1; then
+        PG_SERVICE="127.0.0.1:5432"
+        return 0
+    fi
+
+    die "PostgreSQL could not be started. No usable systemd service, pg_ctlcluster cluster, or pg_ctl data directory was found."
+}
+
+pg_enable_recovery_roles() {
+    # PostgreSQL recovery ALWAYS uses the native local superuser "postgres".
+    # Do not create or enable arbitrary roles from the backup.
+    # pg_dumpall globals may contain ALTER ROLE postgres NOLOGIN, so this
+    # repair MUST happen after globals.sql is restored.
+    local role_state
+
+    log "PostgreSQL: verifying native recovery account 'postgres'..."
+
+    role_state="$(run_as postgres psql -d postgres -Atqc \
+        "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname='postgres') THEN 'EXISTS' ELSE 'MISSING' END;")" ||
+        die "PostgreSQL: could not query pg_roles using the local postgres OS account."
+
+    [[ "$role_state" == "EXISTS" ]] ||
+        die "PostgreSQL: native recovery role 'postgres' does not exist. Refusing to create a replacement recovery account automatically."
+
+    run_as postgres psql -v ON_ERROR_STOP=1 -d postgres -c \
+        'ALTER ROLE postgres LOGIN;' ||
+        die "PostgreSQL: could not enable LOGIN for native recovery role 'postgres'."
+
+    role_state="$(run_as postgres psql -d postgres -Atqc \
+        "SELECT rolname || '|' || CASE WHEN rolcanlogin THEN 'LOGIN' ELSE 'NOLOGIN' END || '|' || CASE WHEN rolsuper THEN 'SUPERUSER' ELSE 'NOSUPERUSER' END FROM pg_roles WHERE rolname='postgres';")" ||
+        die "PostgreSQL: could not verify native recovery role 'postgres'."
+
+    [[ "$role_state" == 'postgres|LOGIN|SUPERUSER' ]] ||
+        die "PostgreSQL: native recovery role verification failed: $role_state"
+
+    log "PostgreSQL: recovery account OK: $role_state"
 }
 
 restore_postgres() {
     [[ "$RESTORE_POSTGRES" == 1 ]] || return 0
-    [[ -d "$TREE/POSTGRES/databases" ]] || {
-        warn "PostgreSQL backup directory not found."
-        return 0
+    [[ -d "$TREE/POSTGRES" ]] || {
+        warn "PostgreSQL backup not present."
+        return
     }
 
-    cmd psql || die "psql is required for PostgreSQL restore."
-    cmd pg_restore || die "pg_restore is required for PostgreSQL restore."
-    cmd runuser || die "runuser is required for local PostgreSQL restore."
-    id postgres >/dev/null 2>&1 || die "PostgreSQL OS user 'postgres' does not exist."
+    log "[6/11] Restoring PostgreSQL"
 
-    log "[6] Restoring PostgreSQL"
-    log "PostgreSQL: preparing backup ownership and permissions..."
+    need_cmd psql
 
-    chown -R postgres:postgres "$TREE/POSTGRES" ||
-        die "Could not assign PostgreSQL backup ownership to postgres."
-    chmod -R u+rwX "$TREE/POSTGRES" ||
-        die "Could not set PostgreSQL backup permissions."
+    id postgres >/dev/null 2>&1 ||
+    die "PostgreSQL OS user does not exist."
 
-    # RESTORE_ROOT/TREE are private by default (umask 077). Grant only
-    # traversal to allow the postgres OS account to reach its own files.
-    chmod o+x "$RESTORE_ROOT" "$TREE" ||
-        die "Could not grant PostgreSQL traverse permission to restore workspace."
+    local PG_RESTORE_BIN
 
-    log "PostgreSQL: backup ownership fixed (postgres:postgres)."
-    log "PostgreSQL: restore workspace traverse permission fixed."
+    PG_RESTORE_BIN="$(get_pg_restore_bin)" ||
+    die "No usable pg_restore executable found."
 
-    systemctl enable postgresql 2>/dev/null || true
-    systemctl start postgresql || die "PostgreSQL service could not be started."
+   log "PostgreSQL restore tool: $("$PG_RESTORE_BIN" --version)"
+        
 
-    local pg_user="${PG_USER:-postgres}"
-    local pg_host="${PG_HOST:-}"
-    local pg_port="${PG_PORT:-}"
-    local use_local_auth=0
-    local -a PSQL_BASE
+    start_postgres
 
-    PSQL_BASE=(psql -v ON_ERROR_STOP=1)
+    PG_STAGE="/var/tmp/server-restore-postgresql-$(date +%Y%m%d_%H%M%S)-$$"
+    local pg_stage="$PG_STAGE"
+    rm -rf "$pg_stage"
+    safe_mkdir "$pg_stage" 0700
 
-    if [[ -n "$pg_host" ]]; then
-        PSQL_BASE+=(-h "$pg_host")
-        [[ -n "$pg_port" ]] && PSQL_BASE+=(-p "$pg_port")
-        PSQL_BASE+=(-U "$pg_user")
-        prompt_password PG_PASSWORD "PostgreSQL user '$pg_user'"
-        [[ -n "${PG_PASSWORD:-}" ]] && export PGPASSWORD="$PG_PASSWORD"
-        log "PostgreSQL: using configured remote/password authentication."
-    else
-        use_local_auth=1
-        log "PostgreSQL: using local OS authentication; old PostgreSQL password is not required."
-    fi
-
-    pg_exec() {
-        if ((use_local_auth)); then
-            runuser -u postgres -- psql -v ON_ERROR_STOP=1 "$@"
-        else
-            "${PSQL_BASE[@]}" "$@"
-        fi
-    }
-
-    pg_restore_exec() {
-        if ((use_local_auth)); then
-            runuser -u postgres -- pg_restore "$@"
-        else
-            pg_restore "$@"
-        fi
-    }
+    # IMPORTANT: backup tree is not chowned. Only the staged database files
+    # are assigned to postgres.
+    safe_mkdir "$pg_stage/databases" 0700
+    chown postgres:postgres "$pg_stage" "$pg_stage/databases"
+    log "PostgreSQL staging directory: $pg_stage"
+    chmod 700 "$pg_stage" "$pg_stage/databases"
 
     if [[ -f "$TREE/POSTGRES/globals.sql" ]]; then
-        log "PostgreSQL: preparing globals.sql for idempotent role restore..."
-        local globals_restore
-        if ((use_local_auth)); then
-            globals_restore="$(restore_postgres_globals_prepare "$TREE/POSTGRES/globals.sql")"
-        else
-            globals_restore="$TREE/POSTGRES/globals.sql"
-        fi
+        cp --preserve=mode,timestamps \
+            "$TREE/POSTGRES/globals.sql" \
+            "$pg_stage/globals.sql"
 
-        log "PostgreSQL: restoring global roles/privileges..."
-        if ! pg_exec -d postgres -f "$globals_restore"; then
-            unset PGPASSWORD
-            die "PostgreSQL globals restore failed."
-        fi
-        log "PostgreSQL: globals restored successfully. Existing roles were preserved without duplicate CREATE ROLE errors."
+        chown postgres:postgres "$pg_stage/globals.sql"
+        chmod 600 "$pg_stage/globals.sql"
+
+        pg_prepare_globals \
+            "$pg_stage/globals.sql" \
+            "$pg_stage/globals.restore.sql"
+
+        log "PostgreSQL: restoring roles/global privileges."
+        run_as postgres psql -v ON_ERROR_STOP=1 \
+            -d postgres \
+            -f "$pg_stage/globals.restore.sql" ||
+            die "PostgreSQL global restore failed."
+
+        # pg_dumpall globals can contain ALTER ROLE postgres NOLOGIN.
+        # Never allow the backup to lock us out of the fresh recovery server.
+        pg_enable_recovery_roles
+    else
+        # Even without globals.sql, make sure the local recovery account works.
+        pg_enable_recovery_roles
     fi
 
     local -a dumps=()
-    local dump db safe db_exists ident total index
+    local dump db
     shopt -s nullglob
-    dumps=( "$TREE"/POSTGRES/databases/*.dump )
+    dumps=( "$TREE/POSTGRES/databases/"*.dump )
     shopt -u nullglob
 
-    total=${#dumps[@]}
-    if ((total == 0)); then
-        unset PGPASSWORD
-        if ((use_local_auth)) && [[ "$pg_user" == "postgres" ]]; then
-            set_new_postgres_password "$pg_user"
-        fi
+    if ((${#dumps[@]} == 0)); then
         warn "No PostgreSQL database dumps found."
-        return 0
+        return
     fi
 
-    index=0
+    local i=0
     for dump in "${dumps[@]}"; do
-        index=$((index + 1))
+        i=$((i + 1))
+        verify_file "$dump"
+
         db="$(basename "$dump" .dump)"
-        safe="$db"
-        ident="$(sql_ident_escape "$safe")"
+        log "PostgreSQL [$i/${#dumps[@]}]: staging $db"
 
-        log "PostgreSQL [$index/$total]: restoring database '$safe'..."
+        cp --preserve=mode,timestamps "$dump" "$pg_stage/databases/$db.dump"
+        chown postgres:postgres "$pg_stage/databases/$db.dump"
+        chmod 600 "$pg_stage/databases/$db.dump"
 
-        db_exists="$(
-            pg_exec -d postgres -Atqc \
-                "SELECT 1 FROM pg_database WHERE datname='$(sql_literal_escape "$safe")';" \
-                2>/dev/null || true
-        )"
+        pg_drop_create_database "$db"
 
-        if [[ "$db_exists" == "1" ]]; then
-            log "PostgreSQL [$index/$total]: dropping existing database '$safe'..."
-            pg_exec -d postgres -c "DROP DATABASE \"$ident\" WITH (FORCE);" || {
-                unset PGPASSWORD
-                die "Could not drop existing PostgreSQL database: $safe"
-            }
-        fi
+        log "PostgreSQL [$i/${#dumps[@]}]: pg_restore $db"
 
-        log "PostgreSQL [$index/$total]: creating database '$safe'..."
-        pg_exec -d postgres -c "CREATE DATABASE \"$ident\";" || {
-            unset PGPASSWORD
-            die "Could not create PostgreSQL database: $safe"
-        }
-
-        log "PostgreSQL [$index/$total]: loading $(basename "$dump")..."
-        if ! pg_restore_exec \
-            -v \
+        run_as postgres pg_restore \
             --exit-on-error \
             --no-owner \
             --no-acl \
-            --dbname="$safe" \
-            "$dump"; then
-            unset PGPASSWORD
-            die "PostgreSQL restore failed for database: $safe"
-        fi
+            --dbname="$db" \
+            "$pg_stage/databases/$db.dump" ||
+            die "PostgreSQL restore failed: $db"
 
-        log "PostgreSQL [$index/$total]: database '$safe' restored successfully."
+        # Basic post-restore verification.
+        run_as postgres psql -d "$db" -Atqc "SELECT current_database();" |
+            grep -Fxq "$db" ||
+            die "PostgreSQL verification failed: $db"
+
+        log "PostgreSQL [$i/${#dumps[@]}]: OK"
     done
 
-    unset PGPASSWORD
+    log "PostgreSQL restore completed."
+}
+ # get pg restore version
 
-    if ((use_local_auth)) && [[ "$pg_user" == "postgres" ]]; then
-        set_new_postgres_password "$pg_user"
+get_pg_restore_bin() {
+    local candidate
+    local best=""
+    local best_major=0
+    local major
+
+    # Prefer the newest installed pg_restore.
+    while IFS= read -r candidate; do
+        [[ -x "$candidate" ]] || continue
+
+        major="$(
+            "$candidate" --version 2>/dev/null |
+                sed -n 's/.*PostgreSQL) \([0-9][0-9]*\).*/\1/p'
+        )"
+
+        [[ "$major" =~ ^[0-9]+$ ]] || continue
+
+        if (( major > best_major )); then
+            best_major="$major"
+            best="$candidate"
+        fi
+    done < <(
+        find /usr/lib/postgresql -type f -path '*/bin/pg_restore' \
+            2>/dev/null | sort -V
+    )
+
+    # Fallback to PATH version.
+    if [[ -z "$best" ]] && command -v pg_restore >/dev/null 2>&1; then
+        best="$(command -v pg_restore)"
     fi
 
-    log "PostgreSQL: restore completed successfully ($total database(s))."
+    [[ -n "$best" ]] || return 1
+
+    printf '%s\n' "$best"
 }
 
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # MongoDB
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+
+start_mongo() {
+    if systemd_usable; then
+        if unit_exists mongod.service && service_start mongod; then
+            MONGO_SERVICE=mongod
+            return 0
+        fi
+        if unit_exists mongodb.service && service_start mongodb; then
+            MONGO_SERVICE=mongodb
+            return 0
+        fi
+    fi
+
+    if have_cmd mongod; then
+        local cfg="${MONGO_CONFIG:-/etc/mongod.conf}"
+        local pidfile="/var/run/mongodb/mongod.pid"
+        local logpath="/var/log/mongodb/mongod.log"
+
+        if [[ -f "$cfg" ]]; then
+            install -d -o mongodb -g mongodb -m 0755 /var/run/mongodb /var/log/mongodb 2>/dev/null || true
+            if ! pgrep -x mongod >/dev/null 2>&1; then
+                log "MongoDB: starting mongod without systemd."
+                run_as mongodb mongod --config "$cfg" --fork --pidfilepath "$pidfile" --logpath "$logpath" || true
+            fi
+        fi
+    fi
+
+    local uri="${MONGO_URI:-mongodb://127.0.0.1:27017}"
+    local i
+    for i in {1..20}; do
+        if have_cmd mongosh; then
+            if mongosh "$uri" --quiet --eval 'db.adminCommand({ping:1}).ok' 2>/dev/null | grep -qx '1'; then
+                MONGO_SERVICE="mongod"
+                log "MongoDB: server is ready."
+                return 0
+            fi
+        elif have_cmd nc; then
+            if nc -z 127.0.0.1 27017 >/dev/null 2>&1; then
+                MONGO_SERVICE="mongod"
+                return 0
+            fi
+        elif pgrep -x mongod >/dev/null 2>&1; then
+            MONGO_SERVICE="mongod"
+            return 0
+        fi
+        sleep 1
+    done
+
+    die "MongoDB could not be started or did not become ready on 127.0.0.1:27017."
+}
 
 restore_mongo() {
     [[ "$RESTORE_MONGO" == 1 ]] || return 0
     [[ -f "$TREE/MONGODB/mongodb.archive.gz" ]] || {
-        warn "MongoDB archive not found."
-        return 0
+        warn "MongoDB backup not present."
+        return
     }
 
-    cmd mongorestore || die "mongorestore is required for MongoDB restore."
-    cmd mongod || warn "mongod binary was not found; assuming MongoDB is provided by an external service."
+    log "[7/11] Restoring MongoDB"
 
-    log "[7] Restoring MongoDB"
-    log "MongoDB: preparing backup ownership and permissions..."
+    need_cmd mongorestore
 
-    # The restore process itself runs as root, but the backup file is kept
-    # private and assigned to the service account when it exists.
-    if id mongodb >/dev/null 2>&1; then
-        chown mongodb:mongodb "$TREE/MONGODB/mongodb.archive.gz" ||
-            die "Could not assign MongoDB backup ownership."
-    else
-        chown root:root "$TREE/MONGODB/mongodb.archive.gz" ||
-            die "Could not assign MongoDB backup ownership."
-    fi
-    chmod 600 "$TREE/MONGODB/mongodb.archive.gz" ||
-        die "Could not set MongoDB backup permissions."
+    start_mongo
 
-    log "MongoDB: backup ownership/permissions fixed."
+    local stage="$RESTORE_ROOT/stage/mongodb"
+    rm -rf "$stage"
+    safe_mkdir "$stage" 0700
 
-    if systemctl list-unit-files mongod.service >/dev/null 2>&1; then
-        systemctl enable mongod 2>/dev/null || true
-        systemctl start mongod || die "MongoDB service could not be started."
-        systemctl is-active --quiet mongod || die "MongoDB service is not active."
-    elif systemctl list-unit-files mongodb.service >/dev/null 2>&1; then
-        systemctl enable mongodb 2>/dev/null || true
-        systemctl start mongodb || die "MongoDB service could not be started."
-        systemctl is-active --quiet mongodb || die "MongoDB service is not active."
-    else
-        die "MongoDB service unit not found."
-    fi
+    cp --preserve=mode,timestamps \
+        "$TREE/MONGODB/mongodb.archive.gz" \
+        "$stage/mongodb.archive.gz"
+
+    chmod 600 "$stage/mongodb.archive.gz"
 
     local uri="${MONGO_URI:-mongodb://127.0.0.1:27017}"
-    prompt_with_default MONGO_URI "MongoDB URI" "$uri"
-    uri="${MONGO_URI:-mongodb://127.0.0.1:27017}"
 
-    log "MongoDB: restoring archive..."
-    if ! mongorestore \
-        --uri="$uri" \
-        --archive="$TREE/MONGODB/mongodb.archive.gz" \
-        --gzip \
-        --drop \
-        --stopOnError; then
-        die "MongoDB restore failed."
+    if [[ -t 0 && -z "${MONGO_URI:-}" ]]; then
+        read -r -p "MongoDB URI [${uri}]: " answer
+        uri="${answer:-$uri}"
     fi
 
-    log "MongoDB: restore completed successfully."
+    log "MongoDB: restoring archive."
+
+    mongorestore \
+        --uri="$uri" \
+        --archive="$stage/mongodb.archive.gz" \
+        --gzip \
+        --drop \
+        --stopOnError ||
+        die "MongoDB restore failed."
+
+    # Connectivity verification.
+    if have_cmd mongosh; then
+        mongosh "$uri" --quiet --eval 'db.adminCommand({ping:1}).ok' |
+            grep -qx '1' ||
+            die "MongoDB ping verification failed."
+    fi
+
+    log "MongoDB restore completed."
 }
 
-# -------------------------------------------------------------------
-# MSSQL
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Microsoft SQL Server
+# ---------------------------------------------------------------------------
 
-mssql_escape_identifier() {
-    local value="$1"
-    printf '%s' "${value//]/]]}"
+mssql_ident() {
+    local s="$1"
+    printf '%s' "${s//]/]]}"
 }
 
-mssql_escape_literal() {
-    local value="$1"
-    printf '%s' "${value//\'/\'\'}"
+mssql_lit() {
+    local s="$1"
+    printf '%s' "${s//\'/\'\'}"
 }
 
-mssql_validate_password() {
+mssql_password_valid() {
     local p="$1"
-    local len count=0
-    len=${#p}
-
-    ((len >= 8 && len <= 128)) || return 1
-    [[ "$p" =~ [A-Z] ]] && count=$((count + 1))
-    [[ "$p" =~ [a-z] ]] && count=$((count + 1))
-    [[ "$p" =~ [0-9] ]] && count=$((count + 1))
-    [[ "$p" =~ [^A-Za-z0-9] ]] && count=$((count + 1))
-
-    ((count >= 3))
+    local n=0
+    (( ${#p} >= 8 && ${#p} <= 128 )) || return 1
+    [[ "$p" =~ [A-Z] ]] && n=$((n+1))
+    [[ "$p" =~ [a-z] ]] && n=$((n+1))
+    [[ "$p" =~ [0-9] ]] && n=$((n+1))
+    [[ "$p" =~ [^A-Za-z0-9] ]] && n=$((n+1))
+    (( n >= 3 ))
 }
 
-prompt_mssql_sa_password() {
+get_mssql_password() {
+    if [[ -n "${MSSQL_PASSWORD:-}" ]]; then
+        mssql_password_valid "$MSSQL_PASSWORD" ||
+            die "MSSQL_PASSWORD does not satisfy SQL Server password policy."
+        return
+    fi
+
+    [[ -t 0 ]] || die "MSSQL_PASSWORD is required in non-interactive mode."
+
     local p1 p2
     while true; do
-        read -r -s -p "NEW MSSQL sa password: " p1
+        read -r -s -p "MSSQL password: " p1
         echo
-        read -r -s -p "Confirm NEW MSSQL sa password: " p2
+        read -r -s -p "Confirm MSSQL password: " p2
         echo
 
-        [[ "$p1" == "$p2" ]] || { warn "MSSQL passwords do not match."; continue; }
-        mssql_validate_password "$p1" || {
-            warn "MSSQL password must be 8-128 characters and contain characters from at least 3 of: uppercase, lowercase, number, symbol."
+        [[ "$p1" == "$p2" ]] || {
+            warn "Passwords do not match."
             continue
         }
-        MSSQL_NEW_SA_PASSWORD="$p1"
+
+        mssql_password_valid "$p1" || {
+            warn "Password must be 8-128 chars and contain 3 of uppercase/lowercase/number/symbol."
+            continue
+        }
+
+        MSSQL_PASSWORD="$p1"
         unset p1 p2
-        return 0
+        return
     done
 }
 
-setup_fresh_mssql_if_needed() {
-    local server_conf="/var/opt/mssql/mssql.conf"
+mssql_setup_if_needed() {
+    [[ -x /opt/mssql/bin/mssql-conf ]] ||
+        die "mssql-conf is unavailable."
+
+    local conf="/var/opt/mssql/mssql.conf"
+
+    if [[ -f "$conf" ]] &&
+       grep -qiE '^[[:space:]]*accepteula[[:space:]]*=[[:space:]]*[Yy]' "$conf"; then
+        return
+    fi
+
+    log "MSSQL: first-time setup required."
+
+    get_mssql_password
+
     local pid="${MSSQL_PID:-Developer}"
 
-    [[ -x /opt/mssql/bin/mssql-conf ]] || die "mssql-conf is not installed."
-
-    # Native package installs require an initial mssql-conf setup. Detect a
-    # configured instance by the presence of the EULA acceptance setting.
-    if [[ -f "$server_conf" ]] && grep -qiE '^[[:space:]]*accepteula[[:space:]]*=[[:space:]]*[Yy]' "$server_conf"; then
-        return 0
-    fi
-
-    echo
-    echo "Fresh SQL Server installation detected."
-    echo "A NEW sa password is required; the old server password is not needed."
-    prompt_with_default MSSQL_PID "MSSQL edition/product ID" "$pid"
-    pid="$MSSQL_PID"
-    prompt_mssql_sa_password
-
-    log "MSSQL: performing unattended first-time setup..."
-    if ! ACCEPT_EULA=Y MSSQL_PID="$pid" MSSQL_SA_PASSWORD="$MSSQL_NEW_SA_PASSWORD" \
-        /opt/mssql/bin/mssql-conf -n setup; then
-        unset MSSQL_NEW_SA_PASSWORD
+    ACCEPT_EULA=Y \
+    MSSQL_PID="$pid" \
+    MSSQL_SA_PASSWORD="$MSSQL_PASSWORD" \
+        /opt/mssql/bin/mssql-conf -n setup ||
         die "MSSQL first-time setup failed."
-    fi
 
-    MSSQL_PASSWORD="$MSSQL_NEW_SA_PASSWORD"
-    unset MSSQL_NEW_SA_PASSWORD
-    systemctl enable mssql-server >/dev/null 2>&1 || true
-    systemctl restart mssql-server || die "MSSQL service failed to start after initial setup."
+    if systemd_usable; then
+        systemctl enable mssql-server >/dev/null 2>&1 || true
+        systemctl restart mssql-server || die "MSSQL service failed after setup."
+    else
+        log "MSSQL: systemd unavailable; starting sqlservr directly."
+        if ! pgrep -f '/opt/mssql/bin/sqlservr' >/dev/null 2>&1; then
+            runuser -u mssql -- /opt/mssql/bin/sqlservr >/var/opt/mssql/sqlservr.restore.log 2>&1 &
+            sleep 8
+        fi
+        pgrep -f '/opt/mssql/bin/sqlservr' >/dev/null 2>&1 ||
+            die "MSSQL sqlservr process failed to start."
+    fi
+}
+
+wait_mssql_ready() {
+    local hostport="${1:-127.0.0.1,1433}"
+    local i
+    for i in {1..30}; do
+        if have_cmd sqlcmd && SQLCMDPASSWORD="${MSSQL_PASSWORD:-}" sqlcmd -S "$hostport" -C -b -U "${MSSQL_USER:-sa}" -Q 'SELECT 1' >/dev/null 2>&1; then
+            log "MSSQL: SQL Server is ready at $hostport."
+            return 0
+        fi
+        sleep 1
+    done
+    die "MSSQL did not become ready at $hostport."
+}
+
+mssql_sqlcmd() {
+    SQLCMDPASSWORD="$MSSQL_PASSWORD" \
+        sqlcmd -S "$MSSQL_SERVER" -C -b -U "$MSSQL_USER" "$@"
+}
+
+mssql_enable_recovery_login() {
+    # The built-in sa account is the native SQL Server recovery account.
+    # A .bak restores database state, not server-level login state.
+    # Therefore [sa] is repaired and verified independently.
+    log "MSSQL: verifying native recovery login [sa]..."
+
+    mssql_sqlcmd -Q "
+IF NOT EXISTS (
+    SELECT 1 FROM sys.server_principals WHERE name = N'sa'
+)
+    THROW 50001, 'Built-in recovery login [sa] does not exist.', 1;
+
+IF EXISTS (
+    SELECT 1 FROM sys.server_principals
+    WHERE name = N'sa' AND is_disabled = 1
+)
+    ALTER LOGIN [sa] ENABLE;
+
+IF IS_SRVROLEMEMBER(N'sysadmin', N'sa') <> 1
+    ALTER SERVER ROLE [sysadmin] ADD MEMBER [sa];
+
+SELECT
+    name,
+    is_disabled,
+    IS_SRVROLEMEMBER(N'sysadmin', N'sa') AS is_sysadmin
+FROM sys.server_principals
+WHERE name = N'sa';
+" ||
+        die "MSSQL: could not enable/verify [sa]. The supplied login must have sufficient server-level permissions."
+
+    local sa_state
+    sa_state="$(mssql_sqlcmd -h -1 -W -s '|' -Q \
+        "SELECT CAST(is_disabled AS varchar(10)) + '|' + CAST(IS_SRVROLEMEMBER(N'sysadmin', N'sa') AS varchar(10)) FROM sys.server_principals WHERE name=N'sa';")" ||
+        die "MSSQL: could not read [sa] recovery state."
+
+    sa_state="$(printf '%s\n' "$sa_state" | tr -d '\r' | tail -n 1)"
+
+    [[ "$sa_state" == "0|1" ]] ||
+        die "MSSQL: native recovery login [sa] verification failed: '$sa_state' (expected 0|1)."
+
+    log "MSSQL: recovery login OK: sa|ENABLED|SYSADMIN"
 }
 
 restore_mssql() {
     [[ "$RESTORE_MSSQL" == 1 ]] || return 0
     [[ -d "$TREE/MSSQL/bak" ]] || {
-        warn "MSSQL backup directory not found."
-        return 0
+        warn "MSSQL backup not present."
+        return
     }
 
-    cmd sqlcmd || die "sqlcmd is required for MSSQL restore."
+    log "[8/11] Restoring Microsoft SQL Server"
 
-    log "[8] Restoring Microsoft SQL Server"
-    setup_fresh_mssql_if_needed
+    need_cmd sqlcmd
+    mssql_setup_if_needed
 
-    local server="${MSSQL_SERVER:-127.0.0.1,1433}"
-    local user="${MSSQL_USER:-sa}"
-    local password="${MSSQL_PASSWORD:-}"
+    local MSSQL_SERVER="${MSSQL_SERVER:-127.0.0.1,1433}"
+    local MSSQL_USER="${MSSQL_USER:-sa}"
 
-    prompt_with_default MSSQL_SERVER "MSSQL server" "$server"
-    server="$MSSQL_SERVER"
+    get_mssql_password
 
-    prompt_with_default MSSQL_USER "MSSQL username" "$user"
-    user="$MSSQL_USER"
-
-    if [[ -z "$password" ]]; then
-        prompt_password MSSQL_PASSWORD "MSSQL user '$user'"
-        password="${MSSQL_PASSWORD:-}"
+    if systemd_usable; then
+        service_start mssql-server || die "MSSQL service failed to start."
+    elif ! pgrep -f '/opt/mssql/bin/sqlservr' >/dev/null 2>&1; then
+        runuser -u mssql -- /opt/mssql/bin/sqlservr >/var/opt/mssql/sqlservr.restore.log 2>&1 &
+        sleep 8
     fi
 
-    [[ -n "$password" ]] || die "MSSQL password is required for SQL restore."
+    wait_mssql_ready "$MSSQL_SERVER"
 
-    # SQLCMDPASSWORD avoids putting the SA password in the process command line.
-    export SQLCMDPASSWORD="$password"
+    # Restore/backup files cannot be trusted to leave the server-level recovery
+    # login enabled. Fix [sa] before touching any database.
+    mssql_enable_recovery_login
 
-    local -a SQLCMD
-    SQLCMD=(sqlcmd -S "$server" -C -b -U "$user")
+    local stage="/var/opt/mssql/restore-staging"
+    safe_mkdir "$stage" 0750
+    chown mssql:mssql "$stage"
+    chmod 750 "$stage"
 
-    local server_info="$TREE/MSSQL/restore-server-info.txt"
-    if ! "${SQLCMD[@]}" -Q "SELECT @@SERVERNAME AS ServerName, SERVERPROPERTY('Edition') AS Edition, SERVERPROPERTY('ProductVersion') AS ProductVersion;" > "$server_info" 2>&1; then
-        unset SQLCMDPASSWORD MSSQL_PASSWORD
-        die "Cannot connect to MSSQL with the supplied credentials."
-    fi
+    local backup_dir="/var/opt/mssql/backup"
+    safe_mkdir "$backup_dir" 0750
+    chown mssql:mssql "$backup_dir"
+    chmod 750 "$backup_dir"
 
-    # SQL Server reads .bak files as the mssql service account. Stage them in
-    # its native backup directory with strict ownership and permissions.
-    local mssql_backup_dir="/var/opt/mssql/backup"
-    mkdir -p "$mssql_backup_dir"
-    chown mssql:mssql "$mssql_backup_dir" || die "Could not assign MSSQL backup directory ownership."
-    chmod 750 "$mssql_backup_dir" || die "Could not set MSSQL backup directory permissions."
-
-    log "MSSQL: staging backup files into $mssql_backup_dir..."
-
+    local -a baks=()
     shopt -s nullglob
-    local -a baks=( "$TREE"/MSSQL/bak/*.bak )
+    baks=( "$TREE/MSSQL/bak/"*.bak )
     shopt -u nullglob
 
-    local total=${#baks[@]}
-    if ((total == 0)); then
-        unset SQLCMDPASSWORD MSSQL_PASSWORD
-        warn "No MSSQL .bak files found."
-        return 0
-    fi
+    ((${#baks[@]} > 0)) ||
+        die "MSSQL selected but no .bak files were found."
 
-    local bak staged_bak db qdb qpath logical_data logical_log data_file log_file sql
-    local index=0
+    local bak db staged filelist
+    local -i i=0
 
     for bak in "${baks[@]}"; do
-        index=$((index + 1))
+        i=$((i + 1))
+        verify_file "$bak"
+
         db="$(basename "$bak" .bak)"
-        staged_bak="$mssql_backup_dir/$(basename "$bak")"
+        staged="$backup_dir/$(basename "$bak")"
 
-        log "MSSQL [$index/$total]: staging $(basename "$bak")..."
-        install -o mssql -g mssql -m 0600 "$bak" "$staged_bak" ||
-            die "Could not stage MSSQL backup: $bak"
+        log "MSSQL [$i/${#baks[@]}]: staging $db.bak"
 
-        qdb="$(mssql_escape_identifier "$db")"
-        qpath="$(mssql_escape_literal "$staged_bak")"
+        install -o mssql -g mssql -m 0600 \
+            "$bak" "$staged"
 
-        log "MSSQL [$index/$total]: verifying backup '$db'..."
-        if ! "${SQLCMD[@]}" -Q "RESTORE VERIFYONLY FROM DISK=N'$qpath';"; then
+        local qpath
+        qpath="$(mssql_lit "$staged")"
+
+        log "MSSQL [$i/${#baks[@]}]: VERIFYONLY"
+
+        mssql_sqlcmd -Q \
+            "RESTORE VERIFYONLY FROM DISK=N'$qpath';" ||
             die "MSSQL backup verification failed: $db"
-        fi
-        log "MSSQL [$index/$total]: backup verification OK."
 
-        log "MSSQL [$index/$total]: reading logical file names..."
-        logical_data="$(
-            "${SQLCMD[@]}" -h -1 -W -s '|' -Q \
-                "RESTORE FILELISTONLY FROM DISK=N'$qpath';" |
-                awk -F'|' '$3 == "D" || $3 == "ROWS" {print $1; exit}'
-        )"
-        logical_log="$(
-            "${SQLCMD[@]}" -h -1 -W -s '|' -Q \
-                "RESTORE FILELISTONLY FROM DISK=N'$qpath';" |
-                awk -F'|' '$3 == "L" {print $1; exit}'
-        )"
+        filelist="$stage/${db}.filelist.txt"
 
-        logical_data="$(printf '%s' "$logical_data" | sed 's/[[:space:]]*$//')"
-        logical_log="$(printf '%s' "$logical_log" | sed 's/[[:space:]]*$//')"
+        mssql_sqlcmd -h -1 -W -s '|' -Q \
+            "RESTORE FILELISTONLY FROM DISK=N'$qpath';" \
+            > "$filelist" ||
+            die "Could not read MSSQL file list: $db"
 
-        if [[ -z "$logical_data" || -z "$logical_log" ]]; then
-            die "Could not determine logical data/log files for MSSQL database: $db"
-        fi
+        local moves=""
+        local data_seen=0
+        local log_seen=0
+        local logical physical type rest safe target
 
-        mkdir -p /var/opt/mssql/data
-        chown mssql:mssql /var/opt/mssql/data
-        chmod 750 /var/opt/mssql/data
+        while IFS='|' read -r logical physical type rest; do
+            logical="${logical#"${logical%%[![:space:]]*}"}"
+            logical="${logical%"${logical##*[![:space:]]}"}"
+            type="${type#"${type%%[![:space:]]*}"}"
+            type="${type%"${type##*[![:space:]]}"}"
 
-        data_file="/var/opt/mssql/data/${db}.mdf"
-        log_file="/var/opt/mssql/data/${db}_log.ldf"
+            [[ -n "$logical" ]] || continue
 
-        sql="
-IF DB_ID(N'$(mssql_escape_literal "$db")') IS NOT NULL
+            safe="$(printf '%s' "$logical" | tr -cd '[:alnum:]_-')"
+            [[ -n "$safe" ]] || safe="file"
+
+            case "$type" in
+                D)
+                    target="/var/opt/mssql/data/${db}_${safe}.mdf"
+                    data_seen=1
+                    ;;
+                L)
+                    target="/var/opt/mssql/data/${db}_${safe}_log.ldf"
+                    log_seen=1
+                    ;;
+                *)
+                    target="/var/opt/mssql/data/${db}_${safe}.ndf"
+                    ;;
+            esac
+
+            moves+="MOVE N'$(mssql_lit "$logical")' TO N'$(mssql_lit "$target")',"
+        done < "$filelist"
+
+        [[ "$data_seen" -eq 1 ]] ||
+            die "MSSQL backup has no data file: $db"
+        [[ "$log_seen" -eq 1 ]] ||
+            die "MSSQL backup has no log file: $db"
+
+        moves="${moves%,}"
+
+        local qdb
+        qdb="$(mssql_ident "$db")"
+
+        log "MSSQL [$i/${#baks[@]}]: restoring $db"
+
+        mssql_sqlcmd -Q "
+IF DB_ID(N'$(mssql_lit "$db")') IS NOT NULL
 BEGIN
     ALTER DATABASE [$qdb] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
 END;
 
 RESTORE DATABASE [$qdb]
 FROM DISK=N'$qpath'
-WITH
-    REPLACE,
-    RECOVERY,
-    MOVE N'$(mssql_escape_literal "$logical_data")'
-        TO N'$(mssql_escape_literal "$data_file")',
-    MOVE N'$(mssql_escape_literal "$logical_log")'
-        TO N'$(mssql_escape_literal "$log_file")',
-    STATS=5;
+WITH REPLACE, RECOVERY,
+$moves,
+STATS=5;
 
 ALTER DATABASE [$qdb] SET MULTI_USER;
-"
+" || {
+            mssql_sqlcmd -Q \
+                "IF DB_ID(N'$(mssql_lit "$db")') IS NOT NULL
+                 ALTER DATABASE [$qdb] SET MULTI_USER;" >/dev/null 2>&1 || true
+            die "MSSQL restore failed: $db"
+        }
 
-        log "MSSQL [$index/$total]: restoring database '$db'..."
-        if ! "${SQLCMD[@]}" -Q "$sql"; then
-            "${SQLCMD[@]}" -Q \
-                "IF DB_ID(N'$(mssql_escape_literal "$db")') IS NOT NULL ALTER DATABASE [$qdb] SET MULTI_USER;" \
-                >/dev/null 2>&1 || true
-            die "MSSQL restore failed for database: $db"
-        fi
+        # Verify database exists and is online.
+        mssql_sqlcmd -h -1 -W -Q \
+            "SELECT state_desc FROM sys.databases WHERE name=N'$(mssql_lit "$db")';" |
+            tr -d '\r' |
+            grep -qx 'ONLINE' ||
+            die "MSSQL verification failed: database $db is not ONLINE."
 
-        log "MSSQL [$index/$total]: database '$db' restored successfully."
+        # sa is sysadmin, so it has full access to every restored database.
+        # Make the ownership explicit as well; this also avoids orphaned
+        # database-owner state from the source server.
+        mssql_sqlcmd -Q \
+            "ALTER AUTHORIZATION ON DATABASE::[$qdb] TO [sa];" ||
+            die "MSSQL verification failed: could not assign database owner to sa for $db."
+
+        log "MSSQL [$i/${#baks[@]}]: ONLINE + owner=sa + sysadmin access OK"
     done
 
-    unset SQLCMDPASSWORD MSSQL_PASSWORD
-    log "MSSQL: restore completed successfully ($total database(s))."
+    # Final safety check: database restores are complete, so verify the
+    # server-level recovery account one last time.
+    mssql_enable_recovery_login
+
+    unset MSSQL_PASSWORD
+    log "MSSQL restore completed. Recovery login [sa] is enabled."
 }
 
-# -------------------------------------------------------------------
-# Docker volumes
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Docker
+# ---------------------------------------------------------------------------
 
 restore_docker() {
     [[ "$RESTORE_DOCKER" == 1 ]] || return 0
-    [[ -d "$TREE/DOCKER/volumes" ]] || return 0
-    cmd docker || {
-        warn "Docker is not installed; skipping Docker volume restore."
+    [[ -d "$TREE/DOCKER/volumes" ]] || {
+        warn "Docker volume backup not present."
         return 0
     }
 
-    log "[9] Restoring Docker named volumes"
+    log "[9/11] Restoring Docker volumes"
 
-    systemctl enable docker 2>/dev/null || true
-    systemctl start docker || die "Docker service could not be started."
+    resolve_docker_cli
+    if [[ -z "$DOCKER_CMD" ]]; then
+        if (( IN_CONTAINER )); then
+            warn "Docker CLI is unavailable inside this container; Docker volume restore skipped."
+            return 0
+        fi
+        die "Docker command not available."
+    fi
 
-    local archive
-    local vol
+    if (( IN_CONTAINER == 1 && DOCKER_SOCKET_AVAILABLE == 0 )); then
+        warn "Docker container detected but no Docker socket is mounted."
+        warn "Docker volume restore skipped. Mount /var/run/docker.sock to restore host Docker volumes."
+        return 0
+    fi
 
+    if (( DOCKER_SOCKET_AVAILABLE == 0 )); then
+        if systemd_usable; then
+            service_start docker || die "Docker service could not be started."
+        elif have_cmd dockerd; then
+            die "Docker daemon is not running and systemd is unavailable. Start dockerd externally or mount docker.sock."
+        else
+            die "Docker daemon is unavailable."
+        fi
+    else
+        log "Using mounted Docker socket; Docker daemon belongs to the host."
+    fi
+
+    "$DOCKER_CMD" info >/dev/null 2>&1 || die "Docker daemon is not reachable."
+
+    local archive vol mountpoint
     while IFS= read -r -d '' archive; do
         vol="$(basename "$archive" .tar.gz)"
+        [[ "$vol" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "Unsafe Docker volume name: $vol"
 
-        log "Restoring Docker volume: $vol"
+        "$DOCKER_CMD" volume inspect "$vol" >/dev/null 2>&1 ||
+            "$DOCKER_CMD" volume create "$vol" >/dev/null
 
-        docker volume inspect "$vol" >/dev/null 2>&1 ||
-            docker volume create "$vol" >/dev/null
+        mountpoint="$("$DOCKER_CMD" volume inspect --format '{{.Mountpoint}}' "$vol")"
+        [[ -n "$mountpoint" && -d "$mountpoint" ]] ||
+            die "Docker volume mountpoint unavailable: $vol"
 
-        # Use the host tar instead of requiring the alpine image.
-        # The volume is mounted into a temporary container.
-        if ! docker run --rm \
-            -v "$vol:/data" \
-            -v "$(dirname "$archive"):/backup:ro" \
-            alpine:latest \
-            sh -c '
-                set -eu
-                find /data -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-                tar xzf "/backup/'"$(basename "$archive")"'" -C /data
-            '; then
-            die "Docker volume restore failed: $vol"
-        fi
+        log "Docker: restoring volume $vol"
+
+        # Extract into a sibling temporary directory first. This avoids leaving
+        # a half-restored volume when tar extraction fails.
+        local tmp="${mountpoint}.restore-$$"
+        rm -rf -- "$tmp"
+        install -d -m 0700 "$tmp"
+        tar --acls --xattrs --numeric-owner --no-same-owner \
+            -xzf "$archive" -C "$tmp" || {
+                rm -rf -- "$tmp"
+                die "Docker volume restore failed during extraction: $vol"
+            }
+
+        find "$mountpoint" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+        find "$tmp" -mindepth 1 -maxdepth 1 -exec mv -- {} "$mountpoint"/ \;
+        rm -rf -- "$tmp"
     done < <(find "$TREE/DOCKER/volumes" -type f -name '*.tar.gz' -print0)
 
-    log "Docker volume restore completed."
+    log "Docker volumes restored."
 }
-
-# -------------------------------------------------------------------
-# Firewall - opt in only
-# -------------------------------------------------------------------
 
 restore_firewall() {
     [[ "$RESTORE_FIREWALL" == 1 ]] || return 0
 
-    log "[10] Restoring firewall rules"
+    log "[10/11] Restoring firewall"
 
-    if command -v ufw >/dev/null 2>&1 &&
-       [[ -d "$TREE/FIREWALL/etc-ufw" ]]; then
+    if [[ -d "$TREE/FIREWALL/etc-ufw" ]] && have_cmd ufw; then
+        local old="/etc/ufw.before-restore-$(date +%Y%m%d_%H%M%S)"
+        [[ -d /etc/ufw ]] && mv /etc/ufw "$old"
 
-        # Back up current UFW config before replacing it.
-        if [[ -d /etc/ufw ]]; then
-            mv /etc/ufw "/etc/ufw.before-restore-$(date +%Y%m%d_%H%M%S)"
-        fi
-
-        mkdir -p /etc/ufw
-        cp -a "$TREE/FIREWALL/etc-ufw/." /etc/ufw/
-
-        ufw --force enable || die "UFW restore/enable failed."
-
-    elif command -v nft >/dev/null 2>&1 &&
-         [[ -f "$TREE/FIREWALL/nftables-ruleset.txt" ]]; then
-
-        # The backup is textual output from `nft list ruleset`.
+        restore_copy "$TREE/FIREWALL/etc-ufw" /etc/ufw
+        chown -R root:root /etc/ufw
+        ufw --force enable ||
+            die "UFW restore failed."
+    elif [[ -f "$TREE/FIREWALL/nftables-ruleset.txt" ]] && have_cmd nft; then
         nft -c -f "$TREE/FIREWALL/nftables-ruleset.txt" ||
-            die "nftables syntax validation failed."
-
+            die "nftables validation failed."
         nft -f "$TREE/FIREWALL/nftables-ruleset.txt" ||
             die "nftables restore failed."
-
-    elif command -v iptables-restore >/dev/null 2>&1 &&
-         [[ -f "$TREE/FIREWALL/iptables.rules" ]]; then
-
+    elif [[ -f "$TREE/FIREWALL/iptables.rules" ]] &&
+         have_cmd iptables-restore; then
         iptables-restore < "$TREE/FIREWALL/iptables.rules" ||
             die "iptables restore failed."
     else
-        warn "No supported firewall backup/restore method found."
+        warn "No usable firewall backup/method found."
     fi
 }
-
-# -------------------------------------------------------------------
-# SSH - opt in only, validate before reload
-# -------------------------------------------------------------------
 
 restore_ssh() {
     [[ "$RESTORE_SSH" == 1 ]] || return 0
     [[ -d "$TREE/SSH/etc-ssh" ]] || {
-        warn "SSH configuration backup not found."
-        return 0
+        warn "SSH backup not present."
+        return
     }
 
-    log "[11] Restoring SSH configuration"
+    log "[11/11] Restoring SSH"
 
     local old="/etc/ssh.before-restore-$(date +%Y%m%d_%H%M%S)"
 
     cp -a /etc/ssh "$old"
-    cp -a "$TREE/SSH/etc-ssh/." /etc/ssh/
+    restore_copy "$TREE/SSH/etc-ssh" /etc/ssh
+    chown -R root:root /etc/ssh
+    chmod 755 /etc/ssh
 
     if sshd -t; then
-        if systemctl reload ssh 2>/dev/null ||
-           systemctl reload sshd 2>/dev/null; then
-            log "SSH configuration restored successfully."
+        if systemd_usable; then
+            systemctl reload ssh 2>/dev/null ||
+                systemctl reload sshd 2>/dev/null ||
+                warn "SSH configuration valid but reload failed."
         else
-            warn "SSH configuration is valid but reload failed."
+            warn "SSH configuration is valid; service reload skipped because systemd is unavailable."
         fi
     else
-        log "ERROR: SSH configuration is invalid. Rolling back."
-
+        log "SSH validation failed. Rolling back."
         rm -rf /etc/ssh
-        cp -a "$old" /etc/ssh
-
+        mv "$old" /etc/ssh
         sshd -t || true
-        systemctl reload ssh 2>/dev/null ||
-            systemctl reload sshd 2>/dev/null ||
-            true
-
-        die "SSH configuration restore failed and was rolled back."
+        if systemd_usable; then
+            systemctl reload ssh 2>/dev/null ||
+                systemctl reload sshd 2>/dev/null || true
+        fi
+        die "SSH restore failed; previous SSH configuration restored."
     fi
 }
 
-# -------------------------------------------------------------------
-# Final status
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Final verification
+# ---------------------------------------------------------------------------
 
-final_status() {
-    echo
-    echo "============================================================"
-    echo " RESTORE FINISHED"
-    echo "============================================================"
-    echo
-    echo "Archive:"
-    echo "  $ARCHIVE"
-    echo
-    echo "Restore workspace:"
-    echo "  $RESTORE_ROOT"
-    echo
-    echo "Package policy:"
-    if [[ "$UPGRADE_SELECTED_PACKAGES" == 1 ]]; then
-        echo "  Selected restore packages were upgraded/installed."
-    else
-        echo "  Package upgrades were disabled."
-    fi
-    echo
+final_verify() {
+    log "Running final service verification."
 
-    if ((WARNINGS > 0)); then
-        echo "Warnings: $WARNINGS"
-        echo
+    if [[ "$RESTORE_NGINX" == 1 ]] && have_cmd nginx; then
+        nginx -t || die "Final Nginx verification failed."
+        if systemd_usable; then
+            systemctl is-active --quiet nginx || die "Final Nginx service verification failed."
+        else
+            pgrep -x nginx >/dev/null 2>&1 || warn "Nginx configuration is valid but nginx process is not running (no systemd)."
+        fi
     fi
 
-    echo "Failed systemd units:"
-    systemctl --failed --no-legend --no-pager 2>/dev/null || true
-    echo
+    if [[ "$RESTORE_POSTGRES" == 1 ]]; then
+        run_as postgres psql -Atqc "SELECT version();" >/dev/null ||
+            die "Final PostgreSQL query verification failed."
+    fi
 
-    echo "Recommended verification:"
-    echo "  systemctl --failed"
-    echo "  systemctl status nginx"
-    echo "  nginx -t"
-    echo "  systemctl status postgresql"
-    echo "  systemctl status mongod 2>/dev/null || systemctl status mongodb 2>/dev/null"
-    echo "  systemctl status mssql-server 2>/dev/null"
-    echo "  systemctl status docker 2>/dev/null"
-    echo
-    echo "IMPORTANT: Do not delete $RESTORE_ROOT until the restored services"
-    echo "and databases have been verified."
+    if [[ "$RESTORE_MONGO" == 1 ]]; then
+        local uri="${MONGO_URI:-mongodb://127.0.0.1:27017}"
+        if have_cmd mongosh; then
+            mongosh "$uri" --quiet --eval 'db.adminCommand({ping:1}).ok' |
+                grep -qx '1' || die "Final MongoDB ping verification failed."
+        elif ! pgrep -x mongod >/dev/null 2>&1 && ! systemd_usable; then
+            warn "MongoDB client verification unavailable."
+        fi
+    fi
+
+    if [[ "$RESTORE_MSSQL" == 1 ]]; then
+        if systemd_usable; then
+            systemctl is-active --quiet mssql-server || die "Final MSSQL service verification failed."
+        elif pgrep -f '/opt/mssql/bin/sqlservr' >/dev/null 2>&1; then
+            log "MSSQL process verification: OK"
+        else
+            warn "MSSQL service verification skipped because systemd is unavailable."
+        fi
+    fi
+
+    if [[ "$RESTORE_DOCKER" == 1 && -n "$DOCKER_CMD" ]]; then
+        if "$DOCKER_CMD" info >/dev/null 2>&1; then
+            log "Docker daemon verification: OK"
+        else
+            warn "Docker daemon is not reachable during final verification."
+        fi
+    fi
+
+    log "Final verification: OK."
 }
 
-# -------------------------------------------------------------------
+cleanup() {
+    local rc=$?
+
+    if [[ "$CLEANUP_DONE" == 1 ]]; then
+        return
+    fi
+    CLEANUP_DONE=1
+
+    apt_restore_sources || true
+
+    if [[ "$KEEP_STAGING" != "1" && -n "$RESTORE_ROOT" && -d "$RESTORE_ROOT" ]]; then
+        rm -rf "$RESTORE_ROOT" || true
+    fi
+
+    # PostgreSQL staging lives outside RESTORE_ROOT so the postgres service
+    # account can traverse it.
+    if [[ "$KEEP_STAGING" != "1" && -n "$PG_STAGE" && -d "$PG_STAGE" ]]; then
+        rm -rf -- "$PG_STAGE" || true
+    fi
+
+    if [[ "$DEBUG" == "1" ]]; then
+        exec 19>&- 2>/dev/null || true
+    fi
+
+    return "$rc"
+}
+
+trap cleanup EXIT
+trap 'log "Restore interrupted."; exit 130' INT TERM
+
+# ---------------------------------------------------------------------------
 # Main
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 main() {
-    log "Starting server disaster-recovery restore v$SCRIPT_VERSION"
+    require_root
 
-    choose_components
-    install_selected_packages
+    [[ -n "$ARCHIVE" ]] ||
+        die "Usage: $0 /path/to/server-backup.tar.gz"
+
+    if [[ ! -f "$ARCHIVE" ]]; then
+        local requested_name="$(basename -- "$ARCHIVE")"
+        local candidate=""
+        for dir in             /home/ubuntu/server-backups             /home/Admin/server-backups             /backup             /backups             /mnt/backup             /mnt/backups; do
+            if [[ -f "$dir/$requested_name" ]]; then
+                candidate="$dir/$requested_name"
+                break
+            fi
+        done
+
+        if [[ -n "$candidate" ]]; then
+            log "Backup path was not found at '$ARCHIVE'."
+            log "Found same archive by filename at: $candidate"
+            ARCHIVE="$candidate"
+        else
+            die "Backup archive does not exist: $ARCHIVE"
+        fi
+    fi
+
+    [[ -r "$ARCHIVE" ]] ||
+        die "Backup archive is not readable: $ARCHIVE"
+
+    ARCHIVE="$(realpath -e "$ARCHIVE")"
+
+    init_logging
+
+    log "============================================================"
+    log "SERVER DISASTER RECOVERY RESTORE v$VERSION"
+    log "============================================================"
+    detect_os
+    detect_container
+    resolve_docker_cli
+
+    log "Archive: $ARCHIVE"
+    log "Workspace: $RESTORE_ROOT"
+    log "Log: $LOG_FILE"
+    [[ "$DEBUG" == "1" ]] && log "Trace: $TRACE_FILE"
+    log "Execution environment: $([[ "$IN_CONTAINER" == 1 ]] && printf 'container' || printf 'host')"
+    log "systemd available: $SYSTEMD_AVAILABLE"
+    log "Docker socket available: $DOCKER_SOCKET_AVAILABLE"
     extract_archive
+    show_backup_layout
+    choose_restore_components
+    validate_selected_backup
 
-    # Dependency-aware order:
-    # WWW -> SSL -> Nginx -> systemd -> security -> databases -> Docker
+    if [[ "$PLAN_ONLY" == "1" ]]; then
+        log "PLAN_ONLY=1: archive and backup layout validated; no system changes will be made."
+        exit 0
+    fi
+
+    # Installation happens AFTER archive validation.
+    install_selected_packages
+
     restore_www
     restore_letsencrypt
     restore_nginx
@@ -1469,7 +2308,16 @@ main() {
     restore_firewall
     restore_ssh
 
-    final_status
+    final_verify
+
+    log "============================================================"
+    log "RESTORE COMPLETED SUCCESSFULLY"
+    log "============================================================"
+    log "Workspace: $RESTORE_ROOT"
+    log "Log: $LOG_FILE"
+    [[ "$DEBUG" == "1" ]] && log "Trace: $TRACE_FILE"
+    log "Warnings: $WARNINGS"
+    log "Previous live configuration backups were retained where applicable."
 }
 
 main "$@"
