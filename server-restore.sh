@@ -37,6 +37,10 @@ TREE=""
 ERRORS=0
 WARNINGS=0
 
+# Package policy: selected restore packages are upgraded/installed.
+# No full Debian/Ubuntu upgrade is performed automatically.
+UPGRADE_SELECTED_PACKAGES=1
+
 # -------------------------------------------------------------------
 # Logging / error handling
 # -------------------------------------------------------------------
@@ -226,6 +230,30 @@ choose_components() {
 
 APT_DISABLED_REPOS=()
 
+# Recover stale repository files left by an interrupted/older restore run.
+# Example: mssql-release.list.restore-disabled.restore-disabled
+# Only recover the original .list/.sources name when that original file is absent.
+recover_stale_apt_repository_files() {
+    local f original
+    while IFS= read -r -d '' f; do
+        original="$f"
+        while [[ "$original" == *.restore-disabled ]]; do
+            original="${original%.restore-disabled}"
+        done
+
+        if [[ "$original" == *.list || "$original" == *.sources ]]; then
+            if [[ ! -e "$original" ]]; then
+                mv -f -- "$f" "$original" || warn "Could not recover stale APT repository file: $f"
+                log "Recovered stale Microsoft APT source: $original"
+            else
+                # The active source already exists; stale backup is not an active
+                # repository and can safely remain untouched for manual review.
+                log "Leaving stale disabled APT source untouched: $f"
+            fi
+        fi
+    done < <(find /etc/apt/sources.list.d -maxdepth 1 -type f -name '*.restore-disabled*' -print0 2>/dev/null || true)
+}
+
 restore_apt_repositories() {
     local f original
     for f in "${APT_DISABLED_REPOS[@]:-}"; do
@@ -235,6 +263,9 @@ restore_apt_repositories() {
     done
     APT_DISABLED_REPOS=()
 }
+
+# Always put temporarily disabled repositories back, even if package setup fails.
+trap restore_apt_repositories EXIT
 
 setup_mongodb_apt_repo() {
     local id="$1" version_codename="$2" arch
@@ -323,17 +354,24 @@ install_selected_packages() {
             local microsoft_files=()
             local ms_source
 
-            # If MSSQL is not selected, temporarily disable Microsoft APT
-            # sources so an unrelated/broken third-party source cannot block
-            # installation of the restore dependencies.
+            recover_stale_apt_repository_files
+
+            # If MSSQL is not selected, temporarily disable only ACTIVE Microsoft
+            # APT sources. Never scan *.restore-disabled* files; those are backup
+            # names and must not be disabled again.
             if [[ "$RESTORE_MSSQL" != 1 ]]; then
                 while IFS= read -r -d '' f; do
                     microsoft_files+=("$f")
                 done < <(
-                    grep -RIlZE \
-                        'packages\.microsoft\.com' \
-                        /etc/apt/sources.list /etc/apt/sources.list.d \
-                        2>/dev/null || true
+                    {
+                        [[ -f /etc/apt/sources.list ]] && printf '%s\0' /etc/apt/sources.list
+                        find /etc/apt/sources.list.d -maxdepth 1 -type f \
+                            \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null || true
+                    } | while IFS= read -r -d '' f; do
+                        if grep -qiE 'packages\.microsoft\.com' "$f" 2>/dev/null; then
+                            printf '%s\0' "$f"
+                        fi
+                    done
                 )
 
                 for f in "${microsoft_files[@]}"; do
