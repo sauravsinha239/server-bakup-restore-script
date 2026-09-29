@@ -14,7 +14,7 @@ umask 077
 # - Firewall and SSH restoration are OFF by default.
 # - Temporary extracted files are retained by default.
 
-SCRIPT_VERSION="2.4.0"
+SCRIPT_VERSION="2.4.1"
 ARCHIVE="${1:-}"
 
 [[ -n "$ARCHIVE" && -f "$ARCHIVE" ]] || {
@@ -634,7 +634,15 @@ restore_postgres() {
     chmod -R u+rwX "$TREE/POSTGRES" ||
         die "Could not set PostgreSQL backup permissions."
 
+    # The restore workspace is intentionally created with umask 077.
+    # That protects the backup, but it also prevents the postgres OS user
+    # from traversing the parent directories. Grant traverse-only access;
+    # this does NOT grant postgres permission to list or read the parent.
+    chmod o+x "$RESTORE_ROOT" "$TREE" ||
+        die "Could not grant PostgreSQL traverse permission to restore workspace."
+
     log "PostgreSQL: backup ownership fixed (postgres:postgres)."
+    log "PostgreSQL: restore workspace traverse permission fixed."
 
     systemctl enable postgresql 2>/dev/null || true
     systemctl start postgresql || die "PostgreSQL service could not be started."
