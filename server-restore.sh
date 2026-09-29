@@ -14,7 +14,7 @@ umask 077
 # - Firewall and SSH restoration are OFF by default.
 # - Temporary extracted files are retained by default.
 
-SCRIPT_VERSION="2.0.1"
+SCRIPT_VERSION="2.2.0"
 ARCHIVE="${1:-}"
 
 [[ -n "$ARCHIVE" && -f "$ARCHIVE" ]] || {
@@ -130,6 +130,12 @@ RESTORE_DOCKER=1
 RESTORE_FIREWALL=0
 RESTORE_SSH=0
 
+# Package management:
+# - Selected packages are always installed at the newest repository version.
+# - Existing selected packages are upgraded when required.
+# - A full OS distribution upgrade is NOT performed automatically.
+UPGRADE_SELECTED_PACKAGES=1
+
 choose_components() {
     echo
     echo "============================================================"
@@ -173,7 +179,7 @@ choose_components() {
 }
 
 # -------------------------------------------------------------------
-# Package bootstrap
+# Package bootstrap / upgrade
 # -------------------------------------------------------------------
 
 install_selected_packages() {
@@ -181,7 +187,7 @@ install_selected_packages() {
     # shellcheck disable=SC1091
     source /etc/os-release
 
-    if ! prompt_yes_no "Install missing packages before restoring?" Y; then
+    if ! prompt_yes_no "Install/upgrade required packages before restoring?" Y; then
         return 0
     fi
 
@@ -189,69 +195,66 @@ install_selected_packages() {
         ubuntu|debian)
             export DEBIAN_FRONTEND=noninteractive
 
-            # A broken third-party repository must not prevent restoration of
-            # unrelated services. MSSQL is optional, so only require the
-            # Microsoft repository when MSSQL restore is explicitly selected.
-            apt_update_safe() {
-                local microsoft_list=""
-                local disabled_list=""
+            local microsoft_files=()
+            local disabled_files=()
+            local ms_key="/usr/share/keyrings/microsoft-prod.gpg"
 
-                if [[ "$RESTORE_MSSQL" != 1 ]]; then
-                    # Temporarily disable Microsoft repositories if their
-                    # signing key/repository is broken. They are not needed
-                    # for WWW/Nginx/PostgreSQL/Mongo/Docker restoration.
-                    while IFS= read -r microsoft_list; do
-                        [[ -f "$microsoft_list" ]] || continue
-                        disabled_list="${microsoft_list}.restore-disabled"
-                        mv "$microsoft_list" "$disabled_list"
-                        log "Temporarily disabled third-party Microsoft repo: $microsoft_list"
-                    done < <(
-                        grep -RIlE 'packages\.microsoft\.com|packages\.microsoft\.com/ubuntu'                             /etc/apt/sources.list /etc/apt/sources.list.d                             2>/dev/null || true
-                    )
+            # Disable Microsoft repositories while restoring the normal
+            # platform packages unless MSSQL was explicitly selected.
+            if [[ "$RESTORE_MSSQL" != 1 ]]; then
+                while IFS= read -r -d '' f; do
+                    microsoft_files+=("$f")
+                done < <(
+                    grep -RIlZE \
+                        'packages\.microsoft\.com|packages\.microsoft\.com/ubuntu' \
+                        /etc/apt/sources.list /etc/apt/sources.list.d \
+                        2>/dev/null || true
+                )
 
-                    if ! apt-get update -y; then
-                        # Put repositories back before failing.
-                        while IFS= read -r disabled_list; do
-                            [[ -f "$disabled_list" ]] || continue
-                            mv "$disabled_list" "${disabled_list%.restore-disabled}"
-                        done < <(
-                            find /etc/apt/sources.list.d                                 -maxdepth 1 -type f                                 -name '*.restore-disabled' -print 2>/dev/null
-                        )
-                        die "apt-get update failed."
-                    fi
+                for f in "${microsoft_files[@]}"; do
+                    [[ -f "$f" ]] || continue
+                    local disabled="${f}.restore-disabled"
+                    mv "$f" "$disabled"
+                    disabled_files+=("$disabled")
+                    log "Temporarily disabled third-party Microsoft repo: $f"
+                done
+            fi
 
-                    # Re-enable repositories after the package operation.
-                    while IFS= read -r disabled_list; do
-                        [[ -f "$disabled_list" ]] || continue
-                        mv "$disabled_list" "${disabled_list%.restore-disabled}"
-                    done < <(
-                        find /etc/apt/sources.list.d                             -maxdepth 1 -type f                             -name '*.restore-disabled' -print 2>/dev/null
-                    )
-                else
-                    # MSSQL was explicitly selected. Repair the Microsoft
-                    # repository key if the standard key file exists but is
-                    # unreadable or malformed.
-                    local ms_key="/usr/share/keyrings/microsoft-prod.gpg"
-
-                    if [[ -f "$ms_key" ]] && ! gpg --quiet --batch --list-packets "$ms_key" >/dev/null 2>&1; then
-                        log "Existing Microsoft repository key is invalid. Recreating it..."
-                        rm -f "$ms_key"
-                    fi
-
-                    if [[ ! -f "$ms_key" ]]; then
-                        mkdir -p /usr/share/keyrings
-                        curl -fsSL https://packages.microsoft.com/keys/microsoft.asc |
-                            gpg --dearmor --yes -o "$ms_key"
-                        chmod 0644 "$ms_key"
-                    else
-                        chmod 0644 "$ms_key"
-                    fi
-
-                    apt-get update -y
-                fi
+            restore_apt_repositories() {
+                local f
+                for f in "${disabled_files[@]}"; do
+                    [[ -f "$f" ]] || continue
+                    mv "$f" "${f%.restore-disabled}"
+                    log "Re-enabled repository: ${f%.restore-disabled}"
+                done
             }
 
-            apt_update_safe
+            # Always restore repositories on function exit, including failures.
+            trap restore_apt_repositories RETURN
+
+            if [[ "$RESTORE_MSSQL" == 1 ]]; then
+                # MSSQL restore requires the Microsoft repository. Repair the
+                # key if it exists but is invalid.
+                if [[ -f "$ms_key" ]] &&
+                   ! gpg --quiet --batch --list-packets "$ms_key" >/dev/null 2>&1; then
+                    log "Existing Microsoft repository key is invalid. Recreating it..."
+                    rm -f "$ms_key"
+                fi
+
+                if [[ ! -f "$ms_key" ]]; then
+                    cmd curl || apt-get install -y curl
+                    cmd gpg || apt-get install -y gnupg
+                    mkdir -p /usr/share/keyrings
+                    curl -fsSL https://packages.microsoft.com/keys/microsoft.asc |
+                        gpg --dearmor --yes -o "$ms_key"
+                    chmod 0644 "$ms_key"
+                else
+                    chmod 0644 "$ms_key"
+                fi
+            fi
+
+            log "Updating APT package indexes..."
+            apt-get update
 
             local pkgs=(tar gzip coreutils)
             [[ "$RESTORE_NGINX" == 1 ]]    && pkgs+=(nginx)
@@ -260,12 +263,28 @@ install_selected_packages() {
             [[ "$RESTORE_SSH" == 1 ]]      && pkgs+=(openssh-server)
             [[ "$RESTORE_FIREWALL" == 1 ]] && pkgs+=(ufw iptables nftables)
 
+            # Upgrade packages that are already installed, then install
+            # anything missing. This gives us the newest available package
+            # without performing a risky full distro upgrade.
+            if [[ "$UPGRADE_SELECTED_PACKAGES" == 1 && ${#pkgs[@]} -gt 0 ]]; then
+                log "Upgrading selected restore packages where newer versions are available..."
+                apt-get install -y --only-upgrade "${pkgs[@]}" || \
+                    warn "Some already-installed packages could not be upgraded; continuing with installation."
+            fi
+
+            log "Installing required restore packages..."
             apt-get install -y "${pkgs[@]}"
 
             if [[ "$RESTORE_MONGO" == 1 ]] && ! cmd mongorestore; then
+                log "MongoDB restore tool not found; installing MongoDB Database Tools..."
                 apt-get install -y mongodb-database-tools 2>/dev/null ||
                     apt-get install -y mongodb-org-tools 2>/dev/null ||
                     warn "Could not automatically install MongoDB Database Tools."
+            elif [[ "$RESTORE_MONGO" == 1 && "$UPGRADE_SELECTED_PACKAGES" == 1 ]]; then
+                # MongoDB tools are often supplied separately from the OS repo.
+                apt-get install -y --only-upgrade mongodb-database-tools 2>/dev/null ||
+                    apt-get install -y --only-upgrade mongodb-org-tools 2>/dev/null ||
+                    true
             fi
 
             if [[ "$RESTORE_MSSQL" == 1 ]] && ! cmd sqlcmd; then
@@ -275,10 +294,18 @@ install_selected_packages() {
                     warn "sqlcmd is not installed. MSSQL restore will be skipped."
                 fi
             fi
+
+            # Remove RETURN trap before explicitly restoring repositories.
+            trap - RETURN
+            restore_apt_repositories
             ;;
 
         arch)
-            pacman -Sy --noconfirm --needed tar gzip coreutils
+            # pacman -Syu is the correct Arch operation: refresh package
+            # databases and perform a complete, dependency-consistent system
+            # upgrade before installing selected restore packages.
+            log "Synchronizing Arch repositories and upgrading the system..."
+            pacman -Syu --noconfirm --needed
 
             local pkgs=()
             [[ "$RESTORE_NGINX" == 1 ]]    && pkgs+=(nginx)
@@ -289,6 +316,7 @@ install_selected_packages() {
             [[ "$RESTORE_MONGO" == 1 ]]    && pkgs+=(mongodb-tools)
 
             if ((${#pkgs[@]})); then
+                log "Installing/upgrading selected Arch restore packages..."
                 pacman -S --noconfirm --needed "${pkgs[@]}"
             fi
             ;;
@@ -300,39 +328,60 @@ install_selected_packages() {
 }
 
 # -------------------------------------------------------------------
-# Archive extraction and integrity
+# Archive integrity and extraction
 # -------------------------------------------------------------------
+
+verify_archive() {
+    local checksum_file="${ARCHIVE}.sha256"
+
+    log "Testing gzip integrity..."
+    if ! gzip -t "$ARCHIVE"; then
+        die "Gzip integrity check failed. Archive is corrupted."
+    fi
+    log "Gzip integrity: OK"
+
+    log "Testing tar archive structure..."
+    if ! tar -tzf "$ARCHIVE" >/dev/null; then
+        die "Tar archive is corrupt or unreadable."
+    fi
+    log "Tar archive structure: OK"
+
+    if [[ -f "$checksum_file" ]]; then
+        log "Verifying detached SHA-256 checksum..."
+
+        (
+            cd "$(dirname "$ARCHIVE")"
+            sha256sum --strict --check "$(basename "$checksum_file")"
+        ) || die "Archive SHA-256 verification failed. Backup may be corrupted."
+
+        log "Archive SHA-256: OK"
+    else
+        warn "Detached SHA-256 checksum file not found: $checksum_file"
+
+        if ! prompt_yes_no "Continue without SHA-256 verification?" N; then
+            die "Restore aborted because checksum file is missing."
+        fi
+    fi
+}
 
 extract_archive() {
     mkdir -p "$RESTORE_ROOT"
 
-    log "Testing archive readability..."
-    tar -tzf "$ARCHIVE" >/dev/null ||
-        die "Backup archive is corrupt or unreadable."
+    verify_archive
 
     log "Extracting backup archive..."
-    tar --acls --xattrs --numeric-owner \
-        -xzf "$ARCHIVE" \
-        -C "$RESTORE_ROOT"
+    tar --acls --xattrs --numeric-owner         -xzf "$ARCHIVE"         -C "$RESTORE_ROOT" ||
+        die "Backup archive extraction failed."
 
     TREE="$RESTORE_ROOT/server-backup"
 
     [[ -d "$TREE" ]] ||
         die "Invalid archive: missing server-backup directory."
 
-    [[ -f "$TREE/MANIFEST.sha256" ]] ||
-        die "Invalid archive: missing MANIFEST.sha256."
+    [[ -f "$TREE/backup-info.txt" ]] ||
+        warn "backup-info.txt not found; archive may be from an older backup version."
 
-    log "Verifying backup manifest..."
-
-    # sha256sum's --strict makes malformed manifest lines fatal.
-    # This intentionally stops BEFORE modifying the live server.
-    (
-        cd "$TREE"
-        sha256sum --strict -c MANIFEST.sha256
-    ) || die "Backup checksum verification failed or MANIFEST.sha256 contains malformed entries."
-
-    log "Manifest verification: OK"
+    log "Archive extraction: OK"
 }
 
 # -------------------------------------------------------------------
@@ -1006,6 +1055,13 @@ final_status() {
     echo
     echo "Restore workspace:"
     echo "  $RESTORE_ROOT"
+    echo
+    echo "Package policy:"
+    if [[ "$UPGRADE_SELECTED_PACKAGES" == 1 ]]; then
+        echo "  Selected restore packages were upgraded/installed."
+    else
+        echo "  Package upgrades were disabled."
+    fi
     echo
 
     if ((WARNINGS > 0)); then

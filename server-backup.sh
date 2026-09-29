@@ -7,7 +7,7 @@ umask 077
 # and prompts interactively for usernames (with Enter for default) and passwords.
 # Run as root.
 
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.5.0"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/backup.conf}"
 
@@ -45,7 +45,6 @@ WORK="${BACKUP_ROOT}/.work-${HOST}-${STAMP}"
 TREE="${WORK}/server-backup"
 ARCHIVE="${BACKUP_ROOT}/server-backup-${HOST}-${STAMP}.tar.gz"
 LOG="${WORK}/backup.log"
-MANIFEST="${TREE}/MANIFEST.sha256"
 ERRORS=0
 
 mkdir -p "$TREE" "$BACKUP_ROOT"
@@ -701,28 +700,30 @@ find /var/www /opt /srv -type d -name .git -prune -print 2>/dev/null |
   done
 } > "$TREE/backup-info.txt"
 
-# ---------- Checksums and archive ----------
-log "Creating checksums"
-(
-  cd "$TREE"
-  find . -type f ! -name 'MANIFEST.sha256' -print0 |
-    sort -z |
-    xargs -0 sha256sum > "$MANIFEST"
-)
-
+# ---------- Archive integrity ----------
 log "Creating archive"
-if ! tar --acls --xattrs --numeric-owner -czf "$ARCHIVE" -C "$WORK" server-backup backup.log; then
+
+if ! tar --acls --xattrs --numeric-owner \
+    -czf "$ARCHIVE" \
+    -C "$WORK" \
+    server-backup backup.log; then
   die "Failed to create backup archive: $ARCHIVE"
 fi
 
 [[ -s "$ARCHIVE" ]] || die "Backup archive is missing or empty: $ARCHIVE"
 
-log "Verifying archive integrity"
-if ! tar -tzf "$ARCHIVE" >/dev/null; then
-  die "Backup archive integrity check failed: $ARCHIVE"
+log "Testing gzip integrity"
+if ! gzip -t "$ARCHIVE"; then
+  die "gzip integrity check failed: $ARCHIVE"
 fi
 
-if ! sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"; then
+log "Testing tar archive structure"
+if ! tar -tzf "$ARCHIVE" >/dev/null; then
+  die "Backup archive structure/integrity check failed: $ARCHIVE"
+fi
+
+log "Creating detached SHA-256 checksum"
+if ! sha256sum "$(basename "$ARCHIVE")" > "${ARCHIVE}.sha256"; then
   die "Failed to create archive checksum."
 fi
 
