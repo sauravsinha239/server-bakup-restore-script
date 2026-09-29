@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Server Disaster Recovery Restore
-# Version: 3.0.0
+# Version: 3.1.0
 #
 # Design:
 #   1. Preflight and identify OS / architecture
@@ -20,10 +20,16 @@
 #   - Firewall and SSH restoration are OFF by default.
 #
 # Usage:
-#   sudo ./server-restore-production-3.0.0.sh /path/to/backup.tar.gz
+#   sudo ./server-restore-production-3.1.0.sh /path/to/backup.tar.gz
+#   Docker container:
+#   docker run --rm -it -v /path/to/backups:/backup:ro \
+#       -v /var/run/docker.sock:/var/run/docker.sock \
+#       ubuntu:24.04
+#   ./server-restore-production-3.1.0.sh \
+#       /backup/server-backup-YYYY-MM-DD_HHMMSS.tar.gz
 #
 # Debug:
-#   sudo DEBUG=1 ./server-restore-production-3.0.0.sh /path/to/backup.tar.gz
+#   sudo DEBUG=1 ./server-restore-production-3.1.0.sh /path/to/backup.tar.gz
 #
 # Optional environment:
 #   RESTORE_ROOT=/var/tmp/my-restore
@@ -40,7 +46,11 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="3.0.0"
+VERSION="3.1.0"
+IN_CONTAINER=0
+CONTAINER_RUNTIME=""
+SYSTEMD_AVAILABLE=0
+DOCKER_SOCKET_AVAILABLE=0
 ARCHIVE="${1:-}"
 DEBUG="${DEBUG:-0}"
 KEEP_STAGING="${KEEP_STAGING:-1}"
@@ -136,21 +146,151 @@ run_as() {
     runuser -u "$user" -- "$@"
 }
 
+detect_container() {
+    IN_CONTAINER=0
+    CONTAINER_RUNTIME=""
+
+    if [[ -f /.dockerenv ]]; then
+        IN_CONTAINER=1
+        CONTAINER_RUNTIME="docker"
+    elif grep -qaE '(^|/)(docker|containerd|kubepods|podman)(/|$)' /proc/1/cgroup 2>/dev/null; then
+        IN_CONTAINER=1
+        CONTAINER_RUNTIME="container-runtime"
+    elif [[ -r /proc/1/environ ]] &&
+         tr '\0' '\n' < /proc/1/environ 2>/dev/null | grep -q '^container='; then
+        IN_CONTAINER=1
+        CONTAINER_RUNTIME="container"
+    fi
+
+    if have_cmd systemctl && [[ -d /run/systemd/system ]] &&
+       systemctl list-units >/dev/null 2>&1; then
+        SYSTEMD_AVAILABLE=1
+    else
+        SYSTEMD_AVAILABLE=0
+    fi
+
+    if [[ -S /var/run/docker.sock || -S /run/docker.sock ]]; then
+        DOCKER_SOCKET_AVAILABLE=1
+    else
+        DOCKER_SOCKET_AVAILABLE=0
+    fi
+
+    if (( IN_CONTAINER )); then
+        log "Container environment detected: ${CONTAINER_RUNTIME:-unknown}"
+        log "systemd available: $SYSTEMD_AVAILABLE"
+        log "Docker socket mounted: $DOCKER_SOCKET_AVAILABLE"
+    else
+        log "Host environment detected."
+    fi
+}
+
 unit_exists() {
+    (( SYSTEMD_AVAILABLE == 1 )) || return 1
     systemctl list-unit-files "$1" >/dev/null 2>&1
 }
 
 service_start() {
     local svc="$1"
-    systemctl enable "$svc" >/dev/null 2>&1 || true
-    systemctl start "$svc"
-    systemctl is-active --quiet "$svc" || die "Service is not active: $svc"
+
+    if (( SYSTEMD_AVAILABLE == 1 )); then
+        systemctl enable "$svc" >/dev/null 2>&1 || true
+        systemctl start "$svc"
+        systemctl is-active --quiet "$svc" || die "Service is not active: $svc"
+        return
+    fi
+
+    # Docker/container mode: start common daemons directly when possible.
+    case "$svc" in
+        nginx)
+            nginx -t || die "Nginx configuration validation failed."
+            nginx >/dev/null 2>&1 || true
+            sleep 1
+            pgrep -x nginx >/dev/null 2>&1 ||
+                die "Nginx process did not start in container mode."
+            ;;
+        postgresql)
+            if have_cmd pg_ctlcluster && have_cmd pg_lsclusters; then
+                local cluster
+                cluster="$(pg_lsclusters --no-header 2>/dev/null | awk '$4=="down"{print $1 ":" $2; exit}')"
+                if [[ -n "$cluster" ]]; then
+                    pg_ctlcluster "${cluster%%:*}" "${cluster#*:}" start
+                else
+                    cluster="$(pg_lsclusters --no-header 2>/dev/null | awk 'NR==1{print $1 ":" $2}')"
+                    [[ -n "$cluster" ]] || die "No PostgreSQL cluster found in container."
+                    pg_ctlcluster "${cluster%%:*}" "${cluster#*:}" start || true
+                fi
+            elif have_cmd pg_ctl; then
+                die "PostgreSQL cluster is not initialized; cannot start it automatically."
+            else
+                die "No PostgreSQL container start method found."
+            fi
+            ;;
+        mongod|mongodb)
+            if pgrep -x mongod >/dev/null 2>&1; then
+                return
+            fi
+            local conf="/etc/mongod.conf"
+            [[ -f "$conf" ]] || conf="/etc/mongodb.conf"
+            if [[ -f "$conf" ]] && have_cmd mongod; then
+                mongod --config "$conf" --fork >/dev/null 2>&1 || true
+            elif have_cmd mongod; then
+                mongod --dbpath /var/lib/mongodb --fork >/dev/null 2>&1 || true
+            else
+                die "mongod executable not found."
+            fi
+            sleep 2
+            pgrep -x mongod >/dev/null 2>&1 ||
+                die "MongoDB process did not start in container mode."
+            ;;
+        docker)
+            (( DOCKER_SOCKET_AVAILABLE == 1 )) ||
+                die "Docker daemon/socket is unavailable in container mode."
+            ;;
+        crowdsec)
+            warn "CrowdSec service management skipped: systemd is unavailable."
+            ;;
+        mssql-server)
+            if pgrep -f '/opt/mssql/bin/sqlservr' >/dev/null 2>&1; then
+                return
+            fi
+            [[ -x /opt/mssql/bin/sqlservr ]] ||
+                die "SQL Server executable not found."
+            log "MSSQL: starting sqlservr directly because systemd is unavailable."
+            nohup /opt/mssql/bin/sqlservr >/var/log/mssql-container.log 2>&1 &
+            sleep 5
+            pgrep -f '/opt/mssql/bin/sqlservr' >/dev/null 2>&1 ||
+                die "SQL Server process did not start in container mode."
+            ;;
+        *)
+            warn "Cannot start service '$svc': systemd is unavailable."
+            ;;
+    esac
 }
 
 service_restart() {
     local svc="$1"
-    systemctl restart "$svc"
-    systemctl is-active --quiet "$svc" || die "Service failed after restart: $svc"
+    if (( SYSTEMD_AVAILABLE == 1 )); then
+        systemctl restart "$svc"
+        systemctl is-active --quiet "$svc" || die "Service failed after restart: $svc"
+    else
+        case "$svc" in
+            nginx)
+                nginx -s reload >/dev/null 2>&1 || service_start nginx
+                ;;
+            postgresql)
+                service_start postgresql
+                ;;
+            mongod|mongodb)
+                service_start "$svc"
+                ;;
+            mssql-server)
+                service_start mssql-server
+                ;;
+            *)
+                service_start "$svc"
+                ;;
+        esac
+    fi
 }
 
 require_root() {
@@ -588,8 +728,13 @@ install_selected_packages() {
             [[ "$RESTORE_MSSQL" == 1 ]] &&
                 install_mssql
 
-            [[ "$RESTORE_DOCKER" == 1 ]] &&
-                apt-get install -y docker.io
+            if [[ "$RESTORE_DOCKER" == 1 ]]; then
+                if (( IN_CONTAINER == 1 && DOCKER_SOCKET_AVAILABLE == 0 )); then
+                    warn "Docker restore requested, but running inside a container without a Docker socket; Docker daemon package will not be installed."
+                else
+                    apt-get install -y docker.io
+                fi
+            fi
 
             [[ "$RESTORE_SSH" == 1 ]] &&
                 apt-get install -y openssh-server
@@ -613,8 +758,13 @@ install_selected_packages() {
             [[ "$RESTORE_MSSQL" == 1 ]] &&
                 die "Microsoft SQL Server Linux is not installed from Arch official repositories. Use a supported Ubuntu host/package for automatic MSSQL recovery."
 
-            [[ "$RESTORE_DOCKER" == 1 ]] &&
-                pacman -S --noconfirm --needed docker
+            if [[ "$RESTORE_DOCKER" == 1 ]]; then
+                if (( IN_CONTAINER == 1 && DOCKER_SOCKET_AVAILABLE == 0 )); then
+                    warn "Docker restore requested, but no Docker socket is available inside this container."
+                else
+                    pacman -S --noconfirm --needed docker
+                fi
+            fi
 
             [[ "$RESTORE_SSH" == 1 ]] &&
                 pacman -S --noconfirm --needed openssh
@@ -746,7 +896,9 @@ restore_nginx() {
 
     restore_copy "$TREE/NGINX/etc-nginx" "$stage"
 
-    systemctl stop nginx 2>/dev/null || true
+    if (( SYSTEMD_AVAILABLE == 1 )); then
+        systemctl stop nginx 2>/dev/null || true
+    fi
 
     if [[ -e /etc/nginx ]]; then
         mv /etc/nginx "$old"
@@ -762,13 +914,15 @@ restore_nginx() {
         log "Nginx validation failed. Rolling back."
         rm -rf /etc/nginx
         [[ -d "$old" ]] && mv "$old" /etc/nginx
-        systemctl start nginx 2>/dev/null || true
+        if (( SYSTEMD_AVAILABLE == 1 )); then
+            systemctl start nginx 2>/dev/null || true
+        else
+            nginx >/dev/null 2>&1 || true
+        fi
         die "Nginx restore failed; previous configuration restored."
     fi
 
-    systemctl enable nginx >/dev/null 2>&1 || true
-    systemctl start nginx ||
-        die "Nginx failed to start after successful configuration validation."
+    service_start nginx
 
     log "Nginx restored and running. Previous copy: $old"
 }
@@ -779,6 +933,11 @@ restore_nginx() {
 
 restore_systemd() {
     [[ "$RESTORE_SYSTEMD" == 1 ]] || return 0
+
+    if (( SYSTEMD_AVAILABLE == 0 )); then
+        warn "Skipping systemd unit restore: systemd is not available in this environment."
+        return 0
+    fi
 
     log "[4/11] Restoring systemd units"
 
@@ -1321,8 +1480,22 @@ restore_docker() {
 
     log "[9/11] Restoring Docker volumes"
 
+    if (( IN_CONTAINER == 1 && DOCKER_SOCKET_AVAILABLE == 0 )); then
+        warn "Docker container detected but no Docker socket is mounted."
+        warn "Docker volume restore is skipped. Mount /var/run/docker.sock to restore host Docker volumes."
+        return 0
+    fi
+
     have_cmd docker || die "Docker command not available."
-    service_start docker
+
+    if (( DOCKER_SOCKET_AVAILABLE == 0 )); then
+        service_start docker
+    else
+        log "Using mounted Docker socket; Docker daemon belongs to the host."
+    fi
+
+    docker info >/dev/null 2>&1 ||
+        die "Docker daemon is not reachable."
 
     local archive vol mountpoint
     while IFS= read -r -d '' archive; do
@@ -1422,35 +1595,62 @@ final_verify() {
 
     if [[ "$RESTORE_NGINX" == 1 ]]; then
         nginx -t || die "Final Nginx verification failed."
-        systemctl is-active --quiet nginx ||
-            die "Final Nginx service verification failed."
+        if (( SYSTEMD_AVAILABLE == 1 )); then
+            systemctl is-active --quiet nginx ||
+                die "Final Nginx service verification failed."
+        else
+            pgrep -x nginx >/dev/null 2>&1 ||
+                die "Final Nginx process verification failed in container mode."
+        fi
     fi
 
     if [[ "$RESTORE_POSTGRES" == 1 ]]; then
-        systemctl is-active --quiet postgresql ||
-            die "Final PostgreSQL service verification failed."
+        if (( SYSTEMD_AVAILABLE == 1 )); then
+            systemctl is-active --quiet postgresql ||
+                die "Final PostgreSQL service verification failed."
+        fi
         run_as postgres psql -Atqc "SELECT version();" >/dev/null ||
             die "Final PostgreSQL query verification failed."
     fi
 
     if [[ "$RESTORE_MONGO" == 1 ]]; then
-        if unit_exists mongod.service; then
-            systemctl is-active --quiet mongod ||
-                die "Final MongoDB service verification failed."
-        elif unit_exists mongodb.service; then
-            systemctl is-active --quiet mongodb ||
-                die "Final MongoDB service verification failed."
+        if (( SYSTEMD_AVAILABLE == 1 )); then
+            if unit_exists mongod.service; then
+                systemctl is-active --quiet mongod ||
+                    die "Final MongoDB service verification failed."
+            elif unit_exists mongodb.service; then
+                systemctl is-active --quiet mongodb ||
+                    die "Final MongoDB service verification failed."
+            fi
+        elif have_cmd mongosh; then
+            local verify_uri="${MONGO_URI:-mongodb://127.0.0.1:27017}"
+            mongosh "$verify_uri" --quiet --eval 'db.adminCommand({ping:1}).ok' |
+                grep -qx '1' ||
+                die "Final MongoDB ping verification failed."
+        else
+            pgrep -x mongod >/dev/null 2>&1 ||
+                die "Final MongoDB process verification failed in container mode."
         fi
     fi
 
     if [[ "$RESTORE_MSSQL" == 1 ]]; then
-        systemctl is-active --quiet mssql-server ||
-            die "Final MSSQL service verification failed."
+        if (( SYSTEMD_AVAILABLE == 1 )); then
+            systemctl is-active --quiet mssql-server ||
+                die "Final MSSQL service verification failed."
+        else
+            pgrep -f '/opt/mssql/bin/sqlservr' >/dev/null 2>&1 ||
+                die "Final MSSQL process verification failed in container mode."
+        fi
     fi
 
     if [[ "$RESTORE_DOCKER" == 1 ]]; then
-        systemctl is-active --quiet docker ||
-            die "Final Docker service verification failed."
+        if (( IN_CONTAINER == 1 && DOCKER_SOCKET_AVAILABLE == 0 )); then
+            warn "Final Docker verification skipped: no Docker socket is mounted."
+        else
+            have_cmd docker || die "Final Docker verification failed: docker CLI missing."
+            docker info >/dev/null 2>&1 ||
+                die "Final Docker verification failed: daemon unreachable."
+        fi
     fi
 
     log "Final verification: OK."
@@ -1510,8 +1710,12 @@ main() {
     log "Workspace: $RESTORE_ROOT"
     log "Log: $LOG_FILE"
     [[ "$DEBUG" == "1" ]] && log "Trace: $TRACE_FILE"
+    log "Execution environment: $([[ "$IN_CONTAINER" == 1 ]] && printf 'container' || printf 'host')"
+    log "systemd available: $SYSTEMD_AVAILABLE"
+    log "Docker socket available: $DOCKER_SOCKET_AVAILABLE"
 
     detect_os
+    detect_container
     extract_archive
     show_backup_layout
     validate_selected_backup
