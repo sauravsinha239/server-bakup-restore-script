@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Server Disaster Recovery Restore
-# Version: 4.0.0
+# Version: 4.1.1
 #
 # Design:
 #   1. Preflight and identify OS / architecture
@@ -48,7 +48,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="4.1.0"
+VERSION="4.1.1"
 IN_CONTAINER=0
 CONTAINER_RUNTIME=""
 SYSTEMD_AVAILABLE=0
@@ -1002,39 +1002,59 @@ restore_letsencrypt() {
 }
 
 normalize_nginx_http2() {
-    # Only handles the current Nginx deprecation:
-    #   listen 443 ssl http2;
-    # becomes:
-    #   listen 443 ssl;
-    #   http2 on;
-    local file tmp
+    # Nginx 1.25.1+ supports the standalone `http2 on;` directive.
+    # Older Nginx (including Ubuntu 24.04's common 1.24.x package) uses:
+    #     listen 443 ssl http2;
+    # Therefore NEVER convert the old syntax on an older Nginx binary.
+    local nginx_version major minor patch file tmp
 
-    while IFS= read -r -d '' file; do
-        if grep -Eq '^[[:space:]]*listen[[:space:]].*[[:space:]]http2[[:space:]]*;' "$file"; then
-            tmp="${file}.tmp.$$"
+    nginx_version="$(nginx -v 2>&1 | sed -n 's#^nginx version: nginx/##p' | head -n1)"
+    [[ -n "$nginx_version" ]] || {
+        warn "Could not determine Nginx version; leaving HTTP/2 syntax unchanged."
+        return 0
+    }
 
-            awk '
-            BEGIN { inserted=0 }
-            {
-                line=$0
-                if (line !~ /^[[:space:]]*#/ &&
-                    line ~ /^[[:space:]]*listen[[:space:]].*[[:space:]]http2[[:space:]]*;/) {
-                    sub(/[[:space:]]+http2[[:space:]]*;/, ";", line)
-                    print line
-                    if (!inserted) {
-                        print "    http2 on;"
-                        inserted=1
+    major="${nginx_version%%.*}"
+    local rest="${nginx_version#*.}"
+    minor="${rest%%.*}"
+    patch="${rest#*.}"
+    patch="${patch%%[^0-9]*}"
+    patch="${patch:-0}"
+
+    log "Nginx version detected: $nginx_version"
+
+    # Standalone `http2 on;` is supported from 1.25.1.
+    if (( major > 1 || (major == 1 && minor > 25) ||
+          (major == 1 && minor == 25 && patch >= 1) )); then
+        while IFS= read -r -d '' file; do
+            if grep -Eq '^[[:space:]]*listen[[:space:]].*[[:space:]]http2[[:space:]]*;' "$file"; then
+                tmp="${file}.tmp.$$"
+
+                awk '
+                BEGIN { inserted=0 }
+                {
+                    line=$0
+                    if (line !~ /^[[:space:]]*#/ &&
+                        line ~ /^[[:space:]]*listen[[:space:]].*[[:space:]]http2[[:space:]]*;/) {
+                        sub(/[[:space:]]+http2[[:space:]]*;/, ";", line)
+                        print line
+                        if (!inserted) {
+                            print "    http2 on;"
+                            inserted=1
+                        }
+                    } else {
+                        print line
                     }
-                } else {
-                    print line
-                }
-            }' "$file" > "$tmp" || die "Failed editing Nginx file: $file"
+                }' "$file" > "$tmp" || die "Failed editing Nginx file: $file"
 
-            cat "$tmp" > "$file"
-            rm -f "$tmp"
-            log "Nginx: converted deprecated listen ... http2 syntax in $file"
-        fi
-    done < <(find /etc/nginx -type f -print0 2>/dev/null)
+                cat "$tmp" > "$file"
+                rm -f "$tmp"
+                log "Nginx: converted deprecated listen ... http2 syntax in $file (Nginx $nginx_version)"
+            fi
+        done < <(find /etc/nginx -type f -print0 2>/dev/null)
+    else
+        log "Nginx $nginx_version uses legacy listen ... http2 syntax; leaving it unchanged."
+    fi
 }
 
 restore_nginx() {
