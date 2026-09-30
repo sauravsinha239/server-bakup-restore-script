@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Server Disaster Recovery Restore
-# Version: 4.2.2
+# Version: 4.3.0
 #
 # Design:
 #   1. Preflight and identify OS / architecture
@@ -68,7 +68,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION="4.2.2"
+VERSION="4.3.0"
 IN_CONTAINER=0
 CONTAINER_RUNTIME=""
 SYSTEMD_AVAILABLE=0
@@ -103,6 +103,9 @@ RESTORE_SSH=0
 WARNINGS=0
 ERRORS=0
 APT_DISABLED=()
+APT_CURRENT_BACKUP=""
+APT_BACKUP_RESTORED=0
+RESTORE_SUCCESS=0
 CLEANUP_DONE=0
 PG_STAGE=""
 ORIGINAL_ARCHIVE_ARG="${1:-}"
@@ -589,70 +592,93 @@ validate_selected_backup() {
 # APT repository management
 # ---------------------------------------------------------------------------
 
-apt_disable_conflicting_sources() {
-    local f backup_dir backup base stamp
+backup_current_apt_state() {
     [[ "$PACKAGE_MANAGER" == "apt" ]] || return 0
+    local stamp="/var/lib/server-restore/apt-current-backup/$(date +%Y%m%d_%H%M%S)-$$"
+    APT_CURRENT_BACKUP="$stamp"
+    safe_mkdir "$stamp" 0700
+    log "STEP 1: Backing up CURRENT new-server APT sources/keys: $stamp"
+    [[ ! -e /etc/apt/sources.list ]] || cp -a /etc/apt/sources.list "$stamp/sources.list"
+    [[ ! -d /etc/apt/sources.list.d ]] || cp -a /etc/apt/sources.list.d "$stamp/sources.list.d"
+    [[ ! -d /etc/apt/keyrings ]] || cp -a /etc/apt/keyrings "$stamp/keyrings"
+    [[ ! -d /usr/share/keyrings ]] || cp -a /usr/share/keyrings "$stamp/usr-share-keyrings"
+    [[ ! -d /etc/apt/trusted.gpg.d ]] || cp -a /etc/apt/trusted.gpg.d "$stamp/trusted.gpg.d"
+    [[ ! -f /etc/apt/trusted.gpg ]] || cp -a /etc/apt/trusted.gpg "$stamp/trusted.gpg"
+    [[ ! -d /etc/apt/preferences.d ]] || cp -a /etc/apt/preferences.d "$stamp/preferences.d"
+    [[ ! -f /etc/apt/auth.conf ]] || cp -a /etc/apt/auth.conf "$stamp/auth.conf"
+    [[ ! -d /etc/apt/auth.conf.d ]] || cp -a /etc/apt/auth.conf.d "$stamp/auth.conf.d"
+    chmod -R go-rwx "$stamp" 2>/dev/null || true
+    log "Current APT rollback backup created: $APT_CURRENT_BACKUP"
+}
 
-    # Never rename a source file to *.restore-disabled inside sources.list.d:
-    # APT scans that directory and emits noisy "invalid filename extension"
-    # warnings. Store disabled sources outside APT's source directories.
-    backup_dir="/var/lib/server-restore/apt-disabled/$(date +%Y%m%d_%H%M%S)-$$"
-    safe_mkdir "$backup_dir" 0700
+restore_current_apt_state() {
+    [[ "$PACKAGE_MANAGER" == "apt" ]] || return 0
+    [[ -n "$APT_CURRENT_BACKUP" && -d "$APT_CURRENT_BACKUP" ]] || return 0
+    log "Rolling back CURRENT new-server APT state from: $APT_CURRENT_BACKUP"
+    rm -rf /etc/apt/sources.list.d /etc/apt/keyrings /usr/share/keyrings /etc/apt/trusted.gpg.d /etc/apt/preferences.d /etc/apt/auth.conf.d
+    rm -f /etc/apt/sources.list /etc/apt/trusted.gpg /etc/apt/auth.conf
+    [[ ! -e "$APT_CURRENT_BACKUP/sources.list" ]] || cp -a "$APT_CURRENT_BACKUP/sources.list" /etc/apt/sources.list
+    [[ ! -d "$APT_CURRENT_BACKUP/sources.list.d" ]] || cp -a "$APT_CURRENT_BACKUP/sources.list.d" /etc/apt/
+    [[ ! -d "$APT_CURRENT_BACKUP/keyrings" ]] || cp -a "$APT_CURRENT_BACKUP/keyrings" /etc/apt/
+    [[ ! -d "$APT_CURRENT_BACKUP/usr-share-keyrings" ]] || cp -a "$APT_CURRENT_BACKUP/usr-share-keyrings" /usr/share/
+    [[ ! -d "$APT_CURRENT_BACKUP/trusted.gpg.d" ]] || cp -a "$APT_CURRENT_BACKUP/trusted.gpg.d" /etc/apt/
+    [[ ! -f "$APT_CURRENT_BACKUP/trusted.gpg" ]] || cp -a "$APT_CURRENT_BACKUP/trusted.gpg" /etc/apt/trusted.gpg
+    [[ ! -d "$APT_CURRENT_BACKUP/preferences.d" ]] || cp -a "$APT_CURRENT_BACKUP/preferences.d" /etc/apt/
+    [[ ! -f "$APT_CURRENT_BACKUP/auth.conf" ]] || cp -a "$APT_CURRENT_BACKUP/auth.conf" /etc/apt/auth.conf
+    [[ ! -d "$APT_CURRENT_BACKUP/auth.conf.d" ]] || cp -a "$APT_CURRENT_BACKUP/auth.conf.d" /etc/apt/
+    chmod 600 /etc/apt/auth.conf 2>/dev/null || true
+    chmod -R go-rwx /etc/apt/auth.conf.d 2>/dev/null || true
+    log "Current APT state restored."
+}
 
-    while IFS= read -r -d '' f; do
-        case "$f" in
-            *.restore-disabled|*.restore-disabled.*) continue ;;
-        esac
-        if grep -qiE 'packages\.microsoft\.com' "$f" 2>/dev/null; then
-            base="$(basename "$f")"
-            backup="$backup_dir/$base"
-            mv -f -- "$f" "$backup" || die "Could not disable Microsoft APT source: $f"
-            APT_DISABLED+=("$backup::$f")
-            log "Temporarily disabled Microsoft source: $f"
-        fi
-    done < <(
-        find /etc/apt/sources.list.d -maxdepth 1 -type f \
-            \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null || true
-    )
-
-    # Do not move /etc/apt/sources.list as a whole. It normally contains
-    # Ubuntu/Debian official repositories in addition to any third-party lines.
-    if [[ -f /etc/apt/sources.list ]] && grep -qiE 'packages\.microsoft\.com' /etc/apt/sources.list; then
-        warn "Microsoft repository is embedded in /etc/apt/sources.list; leaving it untouched to avoid disabling Ubuntu repositories."
+validate_backup_apt_os() {
+    [[ "$PACKAGE_MANAGER" == "apt" ]] || return 0
+    local meta="$TREE/METADATA/tool-versions.env"
+    [[ -f "$meta" ]] || die "Missing backup metadata: $meta"
+    local backup_id backup_version
+    backup_id="$(sed -n 's/^OS_ID=//p' "$meta" | head -n1 | tr -d "'\"")"
+    backup_version="$(sed -n 's/^OS_VERSION=//p' "$meta" | head -n1 | tr -d "'\"")"
+    [[ -z "$backup_id" || "$backup_id" == "$OS_ID" ]] || die "OS mismatch: backup=$backup_id current=$OS_ID. Refusing old APT repositories."
+    if [[ -n "$backup_version" && "$backup_version" != "$OS_VERSION" && "${ALLOW_OS_MISMATCH:-0}" != "1" ]]; then
+        die "OS version mismatch: backup=$backup_version current=$OS_VERSION. Set ALLOW_OS_MISMATCH=1 only if intentional."
     fi
 }
 
+restore_backup_apt_sources() {
+    [[ "$PACKAGE_MANAGER" == "apt" ]] || return 0
+    local src="$TREE/APT"
+    [[ -d "$src" ]] || die "Backup has no APT repository/key metadata: $src"
+    validate_backup_apt_os
+    log "STEP 2: Restoring OLD server APT sources and signing keys."
+    backup_current_apt_state
+    rm -rf /etc/apt/sources.list.d /etc/apt/keyrings /usr/share/keyrings /etc/apt/trusted.gpg.d /etc/apt/preferences.d
+    rm -f /etc/apt/sources.list /etc/apt/trusted.gpg
+    mkdir -p /etc/apt/sources.list.d /etc/apt/keyrings /usr/share/keyrings /etc/apt/trusted.gpg.d /etc/apt/preferences.d
+    [[ ! -f "$src/sources.list" ]] || cp -a "$src/sources.list" /etc/apt/sources.list
+    [[ ! -d "$src/sources.list.d" ]] || cp -a "$src/sources.list.d/." /etc/apt/sources.list.d/
+    [[ ! -d "$src/keyrings" ]] || { cp -a "$src/keyrings/." /usr/share/keyrings/; cp -a "$src/keyrings/." /etc/apt/keyrings/; }
+    [[ ! -d "$src/trusted.gpg.d" ]] || cp -a "$src/trusted.gpg.d/." /etc/apt/trusted.gpg.d/
+    [[ ! -f "$src/trusted.gpg" ]] || cp -a "$src/trusted.gpg" /etc/apt/trusted.gpg
+    [[ ! -d "$src/preferences.d" ]] || cp -a "$src/preferences.d/." /etc/apt/preferences.d/
+    chmod 0644 /etc/apt/sources.list 2>/dev/null || true
+    find /etc/apt/sources.list.d /etc/apt/keyrings /usr/share/keyrings /etc/apt/trusted.gpg.d /etc/apt/preferences.d -type f -exec chmod 0644 {} + 2>/dev/null || true
+    log "STEP 3: apt-get update using OLD server repositories."
+    apt-get update
+    APT_BACKUP_RESTORED=1
+    log "Old APT repositories and signing keys are now active."
+}
+
 apt_restore_sources() {
-    local entry backup original
-    for entry in "${APT_DISABLED[@]:-}"; do
-        [[ "$entry" == *::* ]] || continue
-        backup="${entry%%::*}"
-        original="${entry#*::}"
-        [[ -f "$backup" ]] || continue
-
-        if [[ -e "$original" ]]; then
-            log "Keeping disabled legacy Microsoft source disabled because a replacement exists: $original"
-            continue
-        fi
-
-        # If the script installed a current Microsoft repository elsewhere,
-        # leave the old conflicting source disabled.
-        if find /etc/apt/sources.list.d -maxdepth 1 -type f \
-            \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null |
-            xargs -0 -r grep -lqiE 'packages\.microsoft\.com'; then
-            log "Keeping disabled legacy Microsoft source disabled because an active Microsoft repository exists."
-            continue
-        fi
-
-        safe_mkdir "$(dirname "$original")" 0755
-        mv -f -- "$backup" "$original" ||
-            warn "Could not restore APT source: $original"
-    done
-    APT_DISABLED=()
+    [[ "$PACKAGE_MANAGER" == "apt" ]] || return 0
+    if [[ "$RESTORE_SUCCESS" != 1 && -n "$APT_CURRENT_BACKUP" && -d "$APT_CURRENT_BACKUP" ]]; then
+        restore_current_apt_state || true
+        apt-get update >/dev/null 2>&1 || true
+    fi
 }
 
 # ---------------------------------------------------------------------------
 # Package installation
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 
 install_base_tools_apt() {
@@ -850,82 +876,88 @@ install_mssql() {
     install_mssql_ubuntu_official
 }
 
+install_exact_apt_packages() {
+    local exact="$TREE/APT/exact-important-packages.txt"
+    local legacy="$TREE/PACKAGES/dpkg-packages.txt"
+    if [[ ! -f "$exact" ]]; then
+        warn "Exact package manifest missing; deriving it from legacy dpkg inventory."
+        [[ -f "$legacy" ]] || die "No exact package manifest or legacy dpkg inventory found."
+        exact="$RESTORE_ROOT/derived-exact-important-packages.txt"
+        awk -F '\t' '$1 ~ /^(postgresql($|-)|postgresql-common$|mssql-|mongodb-|nginx($|-)|crowdsec($|-)|crowdsec-firewall-bouncer|docker(-ce)?($|-)|docker.io$|containerd($|-)|runc$|ca-certificates$|curl$|gnupg$|tar$|gzip$|rsync$|openssl$|openssh-server$|openssh-client$|ufw$|iptables$|nftables$)/ {print}' "$legacy" | sort -u > "$exact"
+    fi
+    log "STEP 4: Installing EXACT package versions captured from old server."
+    local tmp="$RESTORE_ROOT/exact-selected-packages.txt"
+    : > "$tmp"
+    add_matches() { local regex="$1"; awk -F '\t' -v re="$regex" '$1 ~ re {print $1 "\t" $2}' "$exact" >> "$tmp"; }
+    add_matches '^(ca-certificates|curl|gnupg|tar|gzip|rsync|openssl)$'
+    [[ "$RESTORE_NGINX" == 1 ]] && add_matches '^nginx($|-)'
+    [[ "$RESTORE_POSTGRES" == 1 ]] && add_matches '^postgresql($|-)|^postgresql-common$'
+    [[ "$RESTORE_MONGO" == 1 ]] && add_matches '^mongodb-'
+    if [[ "$RESTORE_MSSQL" == 1 ]]; then add_matches '^mssql-'; add_matches '^unixodbc($|-)|^libodbc'; fi
+    [[ "$RESTORE_CROWDSEC" == 1 ]] && add_matches '^crowdsec($|-)|^crowdsec-firewall-bouncer'
+    [[ "$RESTORE_DOCKER" == 1 ]] && add_matches '^docker(-ce)?($|-)|^docker.io$|^containerd($|-)|^runc$'
+    [[ "$RESTORE_SSH" == 1 ]] && add_matches '^openssh-server$|^openssh-client$'
+    [[ "$RESTORE_FIREWALL" == 1 ]] && add_matches '^(ufw|iptables|nftables)$'
+    sort -u "$tmp" -o "$tmp"
+    [[ -s "$tmp" ]] || die "No exact package versions were captured for selected components."
+    local pkg ver
+    while IFS=$'\t' read -r pkg ver; do
+        [[ -n "$pkg" && -n "$ver" ]] || continue
+        apt-cache policy "$pkg" 2>/dev/null | grep -Fq "$ver" || die "EXACT VERSION UNAVAILABLE: ${pkg}=${ver}. Refusing a different version."
+        log "Installing exact: ${pkg}=${ver}"
+        apt-get install -y --allow-downgrades "${pkg}=${ver}" || die "Exact installation failed: ${pkg}=${ver}"
+    done < "$tmp"
+    log "STEP 5: Exact package installation completed."
+}
+
 install_selected_packages() {
     log "Installing required restore software..."
-
     case "$PACKAGE_MANAGER" in
         apt)
             export DEBIAN_FRONTEND=noninteractive
-            apt_disable_conflicting_sources
-            install_base_tools_apt
-
-            if [[ "$RESTORE_NGINX" == 1 ]]; then
-                apt-get install -y nginx
-            fi
-
-            if [[ "$RESTORE_POSTGRES" == 1 ]]; then
-                install_postgres
-            fi
-
-            if [[ "$RESTORE_MONGO" == 1 ]]; then
-                install_mongodb
-            fi
-
-            if [[ "$RESTORE_MSSQL" == 1 ]]; then
-                install_mssql
-            fi
-
-            if [[ "$RESTORE_DOCKER" == 1 ]]; then
-                if (( IN_CONTAINER == 1 && DOCKER_SOCKET_AVAILABLE == 0 )); then
-                    warn "Docker restore requested, but running inside a container without a Docker socket; Docker daemon package will not be installed."
-                else
-                    apt-get install -y docker.io
-                fi
-            fi
-
-            if [[ "$RESTORE_SSH" == 1 ]]; then
-                apt-get install -y openssh-server
-            fi
-
-            if [[ "$RESTORE_FIREWALL" == 1 ]]; then
-                apt-get install -y ufw iptables nftables
-            fi
+            # REQUIRED ORDER: save current -> restore old repos/keys -> update -> exact install.
+            restore_backup_apt_sources
+            install_exact_apt_packages
             ;;
         pacman)
-            pacman -Sy --noconfirm --needed \
-                ca-certificates curl tar gzip rsync
-
-            if [[ "$RESTORE_NGINX" == 1 ]]; then
-                pacman -S --noconfirm --needed nginx
-            fi
-
-            if [[ "$RESTORE_POSTGRES" == 1 ]]; then
-                install_postgres
-            fi
-
-            if [[ "$RESTORE_MONGO" == 1 ]]; then
-                install_mongodb
-            fi
-
-            if [[ "$RESTORE_MSSQL" == 1 ]]; then
-                die "Microsoft SQL Server Linux is not installed from Arch official repositories. Use a supported Ubuntu host/package for automatic MSSQL recovery."
-            fi
-
+            pacman -Sy --noconfirm --needed ca-certificates curl tar gzip rsync
+            [[ "$RESTORE_NGINX" == 1 ]] && pacman -S --noconfirm --needed nginx
+            [[ "$RESTORE_POSTGRES" == 1 ]] && install_postgres
+            [[ "$RESTORE_MONGO" == 1 ]] && install_mongodb
+            [[ "$RESTORE_MSSQL" != 1 ]] || die "MSSQL automatic recovery is not supported from Arch."
             if [[ "$RESTORE_DOCKER" == 1 ]]; then
-                if (( IN_CONTAINER == 1 && DOCKER_SOCKET_AVAILABLE == 0 )); then
-                    warn "Docker restore requested, but no Docker socket is available inside this container."
-                else
-                    pacman -S --noconfirm --needed docker
-                fi
+                if (( IN_CONTAINER == 1 && DOCKER_SOCKET_AVAILABLE == 0 )); then warn "Docker socket unavailable."; else pacman -S --noconfirm --needed docker; fi
             fi
-
-            if [[ "$RESTORE_SSH" == 1 ]]; then
-                pacman -S --noconfirm --needed openssh
-            fi
+            [[ "$RESTORE_SSH" == 1 ]] && pacman -S --noconfirm --needed openssh
             ;;
     esac
+}
 
-    apt_restore_sources
+# ---------------------------------------------------------------------------
+# Restore plan helper
+# ---------------------------------------------------------------------------
+write_restore_plan() {
+    local plan="$RESTORE_ROOT/RESTORE-PLAN.txt"
+    cat > "$plan" <<'EOF_PLAN'
+SERVER DISASTER RECOVERY ORDER
+1. Verify archive + SHA-256.
+2. Detect current OS/architecture.
+3. Validate backup OS matches current OS.
+4. Backup CURRENT new-server APT sources, keyrings, trusted keys and preferences.
+5. Restore OLD server APT sources/keyrings from the backup.
+6. Run apt-get update using OLD repositories.
+7. Install EXACT package versions captured on the old server.
+8. Verify installed versions.
+9. Restore Nginx/CrowdSec/application configuration.
+10. Restore PostgreSQL roles and databases.
+11. Restore MongoDB configuration/users/data.
+12. Restore MSSQL logins and databases.
+13. Restore Docker/application data.
+14. Final verification.
+15. On failure: restore CURRENT new-server APT source/key state.
+16. On success: keep OLD APT repositories active for reproducibility.
+EOF_PLAN
+    log "Restore plan written to: $plan"
 }
 
 # ---------------------------------------------------------------------------
@@ -2285,6 +2317,7 @@ main() {
     log "Docker socket available: $DOCKER_SOCKET_AVAILABLE"
     extract_archive
     show_backup_layout
+    write_restore_plan
     choose_restore_components
     validate_selected_backup
 
@@ -2294,6 +2327,8 @@ main() {
     fi
 
     # Installation happens AFTER archive validation.
+    # APT order is: save current repos/keys -> restore old repos/keys ->
+    # apt-get update -> install exact old package versions.
     install_selected_packages
 
     restore_www
@@ -2309,6 +2344,8 @@ main() {
     restore_ssh
 
     final_verify
+
+    RESTORE_SUCCESS=1
 
     log "============================================================"
     log "RESTORE COMPLETED SUCCESSFULLY"
