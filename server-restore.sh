@@ -888,7 +888,8 @@ restore_backup_apt_sources() {
     log "Old PGDG key ignored."
     log "Fresh official PostgreSQL PGDG key installed."
     log "APT package lists updated successfully."
-} log "Old APT repositories and signing keys are now active."
+ log "Old APT repositories and signing keys are now active."
+}
 
 
 apt_restore_sources() {
