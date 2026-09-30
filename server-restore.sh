@@ -925,120 +925,184 @@ install_mssql() {
 }
 
 install_exact_apt_packages() {
+
     local exact="$TREE/APT/exact-important-packages.txt"
     local legacy="$TREE/PACKAGES/dpkg-packages.txt"
-    if [[ ! -f "$exact" ]]; then
-        warn "Exact package manifest missing; deriving it from legacy dpkg inventory."
-        [[ -f "$legacy" ]] || die "No exact package manifest or legacy dpkg inventory found."
-        exact="$RESTORE_ROOT/derived-exact-important-packages.txt"
-        awk -F '\t' '$1 ~ /^(postgresql($|-)|postgresql-common$|mssql-|mongodb-|nginx($|-)|crowdsec($|-)|crowdsec-firewall-bouncer|docker(-ce)?($|-)|docker.io$|containerd($|-)|runc$|ca-certificates$|curl$|gnupg$|tar$|gzip$|rsync$|openssl$|openssh-server$|openssh-client$|ufw$|iptables$|nftables$)/ {print}' "$legacy" | sort -u > "$exact"
-    fi
-    log "STEP 4: Installing EXACT package versions captured from old server."
-    local tmp="$RESTORE_ROOT/exact-selected-packages.txt"
-    : > "$tmp"
-    add_matches() { local regex="$1"; awk -F '\t' -v re="$regex" '$1 ~ re {print $1 "\t" $2}' "$exact" >> "$tmp"; }
-    add_matches() {
-    local regex="$1"
-    awk -F '\t' -v re="$regex" '$1 ~ re {print $1 "\t" $2}' "$exact" >> "$tmp"
-}
-
-add_matches '^(openssl)$'
-
-[[ "$RESTORE_NGINX" == 1 ]] && \
-    add_matches '^nginx($|-)'
-
-[[ "$RESTORE_POSTGRES" == 1 ]] && \
-    add_matches '^postgresql($|-)|^postgresql-common$'
-
-[[ "$RESTORE_MONGO" == 1 ]] && \
-    add_matches '^mongodb-'
-
-if [[ "$RESTORE_MSSQL" == 1 ]]; then
-    add_matches '^mssql-'
-    add_matches '^unixodbc($|-)|^libodbc'
-fi
-
-[[ "$RESTORE_CROWDSEC" == 1 ]] && \
-    add_matches '^crowdsec($|-)|^crowdsec-firewall-bouncer'
-
-[[ "$RESTORE_DOCKER" == 1 ]] && \
-    add_matches '^docker(-ce)?($|-)|^docker.io$|^containerd($|-)|^runc$'
-
-[[ "$RESTORE_SSH" == 1 ]] && \
-    add_matches '^openssh-server$|^openssh-client$'
-
-[[ "$RESTORE_FIREWALL" == 1 ]] && \
-    add_matches '^(ufw|iptables|nftables)$'
-
-sort -u "$tmp" -o "$tmp"
-[[ -s "$tmp" ]] || die "No package versions were captured for selected components."
-
-local pkg ver major_version
-while IFS=$'\t' read -r pkg ver; do
-
-    [[ -n "$pkg" && -n "$ver" ]] || continue
 
     # ------------------------------------------------------------
-    # We do NOT restore the exact patch/build version.
+    # Load package inventory
+    # ------------------------------------------------------------
+    if [[ ! -f "$exact" ]]; then
+
+        warn "Package manifest missing; deriving it from legacy dpkg inventory."
+
+        [[ -f "$legacy" ]] || \
+            die "No package manifest or legacy dpkg inventory found."
+
+        exact="$RESTORE_ROOT/derived-package-manifest.txt"
+
+        awk -F '\t' '
+            $1 ~ /^(postgresql($|-)|postgresql-common$|mssql-|mongodb-|nginx($|-)|crowdsec($|-)|crowdsec-firewall-bouncer|docker(-ce)?($|-)|docker.io$|containerd($|-)|runc$|ca-certificates$|curl$|gnupg$|tar$|gzip$|rsync$|openssl$|openssh-server$|openssh-client$|ufw$|iptables$|nftables$)/
+            {
+                print
+            }
+        ' "$legacy" | sort -u > "$exact"
+    fi
+
+    log "STEP 4: Selecting packages from old-server package inventory."
+    log "Package sub-version/build numbers will NOT be restored."
+
+    local tmp="$RESTORE_ROOT/selected-packages.txt"
+
+    : > "$tmp"
+
+    # ------------------------------------------------------------
+    # Select packages
+    # ------------------------------------------------------------
+    add_matches() {
+        local regex="$1"
+
+        awk -F '\t' \
+            -v re="$regex" \
+            '$1 ~ re {
+                print $1 "\t" $2
+            }' "$exact" >> "$tmp"
+    }
+
+    # Basic restore tools
+    add_matches '^(ca-certificates|curl|gnupg|tar|gzip|rsync|openssl)$'
+
+    # Nginx
+    [[ "$RESTORE_NGINX" == 1 ]] && \
+        add_matches '^nginx($|-)'
+
+    # PostgreSQL
+    [[ "$RESTORE_POSTGRES" == 1 ]] && \
+        add_matches '^postgresql($|-)|^postgresql-common$'
+
+    # MongoDB
+    [[ "$RESTORE_MONGO" == 1 ]] && \
+        add_matches '^mongodb-'
+
+    # Microsoft SQL Server + ODBC
+    if [[ "$RESTORE_MSSQL" == 1 ]]; then
+        add_matches '^mssql-'
+        add_matches '^unixodbc($|-)|^libodbc'
+    fi
+
+    # CrowdSec
+    [[ "$RESTORE_CROWDSEC" == 1 ]] && \
+        add_matches '^crowdsec($|-)|^crowdsec-firewall-bouncer'
+
+    # Docker
+    [[ "$RESTORE_DOCKER" == 1 ]] && \
+        add_matches '^docker(-ce)?($|-)|^docker.io$|^containerd($|-)|^runc$'
+
+    # SSH
+    [[ "$RESTORE_SSH" == 1 ]] && \
+        add_matches '^openssh-server$|^openssh-client$'
+
+    # Firewall
+    [[ "$RESTORE_FIREWALL" == 1 ]] && \
+        add_matches '^(ufw|iptables|nftables)$'
+
+    sort -u "$tmp" -o "$tmp"
+
+    [[ -s "$tmp" ]] || \
+        die "No packages were captured for the selected restore components."
+
+    # ------------------------------------------------------------
+    # Install packages
+    #
+    # IMPORTANT:
+    #
+    # We intentionally DO NOT use:
+    #
+    #     package=old-version
+    #
+    # The old package version is used only to identify the package.
+    # The NEW server's configured repositories provide the version.
     #
     # Example:
     #
-    #   Backup: postgresql-18 = 18.4-1.pgdg24.04+2
+    #   Backup:
+    #       postgresql-18    18.4-1.pgdg24.04+2
     #
-    #   Restore: install available postgresql-18
+    #   Restore:
+    #       apt-get install postgresql-18
     #
-    # The package name itself preserves the major version.
+    # This preserves PostgreSQL 18 but ignores 18.4 patch/build.
     # ------------------------------------------------------------
 
-    case "$pkg" in
+    local pkg
+    local old_version
 
-        postgresql-*)
-            major_version="${pkg#postgresql-}"
+    while IFS=$'\t' read -r pkg old_version; do
 
-            if [[ "$major_version" =~ ^[0-9]+$ ]]; then
-                log "Installing PostgreSQL major version ${major_version}: ${pkg}"
-            fi
-            ;;
+        [[ -n "$pkg" ]] || continue
 
-        mongodb-*)
-            log "Installing MongoDB package: ${pkg}"
-            ;;
+        case "$pkg" in
 
-        mssql-*)
-            log "Installing MSSQL package: ${pkg}"
-            ;;
+            postgresql-[0-9]*)
+                log "Installing PostgreSQL package: $pkg"
+                log "Backup version: ${old_version:-unknown} (sub-version ignored)"
+                ;;
 
-        nginx|nginx-*)
-            log "Installing Nginx package: ${pkg}"
-            ;;
+            postgresql-common)
+                log "Installing PostgreSQL common package: $pkg"
+                ;;
 
-        crowdsec|crowdsec-*)
-            log "Installing CrowdSec package: ${pkg}"
-            ;;
+            mongodb-*)
+                log "Installing MongoDB package: $pkg"
+                log "Backup version: ${old_version:-unknown} (sub-version ignored)"
+                ;;
 
-        *)
-            log "Installing package: ${pkg}"
-            ;;
+            mssql-*)
+                log "Installing MSSQL package: $pkg"
+                log "Backup version: ${old_version:-unknown} (sub-version ignored)"
+                ;;
 
-    esac
+            nginx|nginx-*)
+                log "Installing Nginx package: $pkg"
+                ;;
 
-    # ------------------------------------------------------------
-    # Install the currently available version from the NEW server's
-    # configured repositories.
-    #
-    # No package=old-version is used.
-    # ------------------------------------------------------------
+            crowdsec|crowdsec-*)
+                log "Installing CrowdSec package: $pkg"
+                ;;
 
-    apt-cache policy "$pkg" 2>/dev/null | grep -q 'Candidate:' || \
-        die "PACKAGE UNAVAILABLE: ${pkg}"
+            *)
+                log "Installing package: $pkg"
+                ;;
 
-    apt-get install -y "$pkg" || \
-        die "Package installation failed: ${pkg}"
+        esac
 
-done < "$tmp"
+        # --------------------------------------------------------
+        # Check that package exists in CURRENT new-server repos.
+        # --------------------------------------------------------
+        local candidate
 
-log "STEP 5: Package installation completed using available repository versions."
+        candidate="$(
+            apt-cache policy "$pkg" 2>/dev/null |
+            awk -F': ' '/^[[:space:]]*Candidate:/ {
+                print $2
+                exit
+            }'
+        )"
+
+        if [[ -z "$candidate" || "$candidate" == "(none)" ]]; then
+            die "PACKAGE UNAVAILABLE IN CURRENT REPOSITORIES: $pkg"
+        fi
+
+        log "Installing ${pkg}=${candidate}"
+
+        apt-get install -y "$pkg" || \
+            die "Package installation failed: $pkg"
+
+    done < "$tmp"
+
+    log "STEP 5: Package installation completed."
 }
+
 
 install_selected_packages() {
 
@@ -1050,13 +1114,18 @@ install_selected_packages() {
 
             export DEBIAN_FRONTEND=noninteractive
 
-            # Keep CURRENT new-server APT repositories and keys.
-            # Do not restore old server APT sources or keys.
+            # ----------------------------------------------------
+            # NEW SERVER APT configuration is preserved.
+            #
+            # OLD server APT sources and keys are NOT restored.
+            # ----------------------------------------------------
             restore_backup_apt_sources
 
-            # Install packages using the major/package identity
-            # captured from the old server, but use the currently
-            # available repository version.
+            # ----------------------------------------------------
+            # Install packages using package identity from backup.
+            #
+            # Patch/build versions are intentionally ignored.
+            # ----------------------------------------------------
             install_exact_apt_packages
 
             ;;
@@ -1064,7 +1133,11 @@ install_selected_packages() {
         pacman)
 
             pacman -Sy --noconfirm --needed \
-                ca-certificates curl tar gzip rsync
+                ca-certificates \
+                curl \
+                tar \
+                gzip \
+                rsync
 
             [[ "$RESTORE_NGINX" == 1 ]] && \
                 pacman -S --noconfirm --needed nginx
@@ -1091,6 +1164,10 @@ install_selected_packages() {
             [[ "$RESTORE_SSH" == 1 ]] && \
                 pacman -S --noconfirm --needed openssh
 
+            ;;
+
+        *)
+            die "Unsupported package manager: $PACKAGE_MANAGER"
             ;;
 
     esac
