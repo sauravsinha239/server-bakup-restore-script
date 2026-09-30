@@ -1707,8 +1707,13 @@ pg_enable_recovery_roles() {
     log "PostgreSQL: recovery account OK: $role_state"
 }
 
+# ============================================================
+# PostgreSQL RESTORE
+# ============================================================
+
 restore_postgres() {
     [[ "$RESTORE_POSTGRES" == 1 ]] || return 0
+
     [[ -d "$TREE/POSTGRES" ]] || {
         warn "PostgreSQL backup not present."
         return
@@ -1716,87 +1721,217 @@ restore_postgres() {
 
     log "[6/11] Restoring PostgreSQL"
 
+    # --------------------------------------------------------
+    # PostgreSQL 18 is mandatory for this backup/recovery.
+    # --------------------------------------------------------
+    local REQUIRED_PG_MAJOR=18
+
     need_cmd psql
 
     id postgres >/dev/null 2>&1 ||
-    die "PostgreSQL OS user does not exist."
+        die "PostgreSQL OS user does not exist."
 
+    # --------------------------------------------------------
+    # Verify installed PostgreSQL major version.
+    # Do NOT restore using PostgreSQL 15/16/17.
+    # --------------------------------------------------------
+    local installed_pg_major=""
+
+    installed_pg_major="$(
+        run_as postgres psql -d postgres -Atqc \
+            "SHOW server_version;" 2>/dev/null |
+            sed 's/^[[:space:]]*//' |
+            sed 's/[[:space:]].*$//' |
+            cut -d. -f1
+    )"
+
+    if [[ ! "$installed_pg_major" =~ ^[0-9]+$ ]]; then
+        die "Unable to determine installed PostgreSQL major version."
+    fi
+
+    log "Installed PostgreSQL major version: $installed_pg_major"
+    log "Required PostgreSQL major version: $REQUIRED_PG_MAJOR"
+
+    if [[ "$installed_pg_major" != "$REQUIRED_PG_MAJOR" ]]; then
+        die "PostgreSQL major version mismatch. Required PostgreSQL $REQUIRED_PG_MAJOR, found PostgreSQL $installed_pg_major."
+    fi
+
+    # --------------------------------------------------------
+    # Get PostgreSQL 18 pg_restore explicitly.
+    # --------------------------------------------------------
     local PG_RESTORE_BIN
 
-    PG_RESTORE_BIN="$(get_pg_restore_bin)" ||
-    die "No usable pg_restore executable found."
+    PG_RESTORE_BIN="$(
+        get_pg_restore_bin "$REQUIRED_PG_MAJOR"
+    )" || die "No usable PostgreSQL ${REQUIRED_PG_MAJOR} pg_restore executable found."
 
-   log "PostgreSQL restore tool: $("$PG_RESTORE_BIN" --version)"
-        
+    log "PostgreSQL restore tool: $("$PG_RESTORE_BIN" --version)"
 
+    # --------------------------------------------------------
+    # Verify pg_restore itself is PostgreSQL 18.
+    # --------------------------------------------------------
+    local restore_pg_major
+
+    restore_pg_major="$(
+        "$PG_RESTORE_BIN" --version 2>/dev/null |
+            sed -n 's/.*PostgreSQL) \([0-9][0-9]*\).*/\1/p'
+    )"
+
+    if [[ "$restore_pg_major" != "$REQUIRED_PG_MAJOR" ]]; then
+        die "Wrong pg_restore major version: PostgreSQL $restore_pg_major. PostgreSQL $REQUIRED_PG_MAJOR is required."
+    fi
+
+    # --------------------------------------------------------
+    # Start PostgreSQL 18.
+    # --------------------------------------------------------
     start_postgres
 
+    # --------------------------------------------------------
+    # PostgreSQL staging directory.
+    # --------------------------------------------------------
     PG_STAGE="/var/tmp/server-restore-postgresql-$(date +%Y%m%d_%H%M%S)-$$"
-    local pg_stage="$PG_STAGE"
-    rm -rf "$pg_stage"
-    safe_mkdir "$pg_stage" 0700
 
-    # IMPORTANT: backup tree is not chowned. Only the staged database files
-    # are assigned to postgres.
+    local pg_stage="$PG_STAGE"
+
+    rm -rf "$pg_stage"
+
+    safe_mkdir "$pg_stage" 0700
     safe_mkdir "$pg_stage/databases" 0700
-    chown postgres:postgres "$pg_stage" "$pg_stage/databases"
+
+    # IMPORTANT:
+    # Backup tree itself is never chowned.
+    # Only staged files are assigned to postgres.
+    chown postgres:postgres \
+        "$pg_stage" \
+        "$pg_stage/databases"
+
+    chmod 700 \
+        "$pg_stage" \
+        "$pg_stage/databases"
+
     log "PostgreSQL staging directory: $pg_stage"
-    chmod 700 "$pg_stage" "$pg_stage/databases"
+
+    # ========================================================
+    # GLOBALS / ROLES / PRIVILEGES
+    # ========================================================
 
     if [[ -f "$TREE/POSTGRES/globals.sql" ]]; then
+
         cp --preserve=mode,timestamps \
             "$TREE/POSTGRES/globals.sql" \
             "$pg_stage/globals.sql"
 
-        chown postgres:postgres "$pg_stage/globals.sql"
-        chmod 600 "$pg_stage/globals.sql"
+        chown postgres:postgres \
+            "$pg_stage/globals.sql"
+
+        chmod 600 \
+            "$pg_stage/globals.sql"
 
         pg_prepare_globals \
             "$pg_stage/globals.sql" \
             "$pg_stage/globals.restore.sql"
 
         log "PostgreSQL: restoring roles/global privileges."
-        run_as postgres psql -v ON_ERROR_STOP=1 \
+
+        run_as postgres psql \
+            -v ON_ERROR_STOP=1 \
             -d postgres \
             -f "$pg_stage/globals.restore.sql" ||
             die "PostgreSQL global restore failed."
 
-        # pg_dumpall globals can contain ALTER ROLE postgres NOLOGIN.
-        # Never allow the backup to lock us out of the fresh recovery server.
+        # pg_dumpall globals can contain:
+        #
+        #   ALTER ROLE postgres NOLOGIN;
+        #
+        # Never allow the backup to lock us out of the
+        # fresh recovery server.
         pg_enable_recovery_roles
+
     else
-        # Even without globals.sql, make sure the local recovery account works.
+
+        log "PostgreSQL globals.sql not found."
+        log "Skipping global roles/privileges restore."
+
+        # Even without globals.sql, make sure the local
+        # recovery account remains usable.
         pg_enable_recovery_roles
     fi
 
+    # ========================================================
+    # DATABASE DUMPS
+    # ========================================================
+
     local -a dumps=()
-    local dump db
+    local dump
+    local db
+
     shopt -s nullglob
     dumps=( "$TREE/POSTGRES/databases/"*.dump )
     shopt -u nullglob
 
     if ((${#dumps[@]} == 0)); then
         warn "No PostgreSQL database dumps found."
+
+        # Remove temporary staging directory.
+        rm -rf "$pg_stage"
+
         return
     fi
 
+    log "PostgreSQL databases found: ${#dumps[@]}"
+
+    # ========================================================
+    # RESTORE EACH DATABASE
+    # ========================================================
+
     local i=0
+
     for dump in "${dumps[@]}"; do
+
         i=$((i + 1))
+
+        # ----------------------------------------------------
+        # Verify backup dump.
+        # ----------------------------------------------------
         verify_file "$dump"
 
         db="$(basename "$dump" .dump)"
+
         log "PostgreSQL [$i/${#dumps[@]}]: staging $db"
 
-        cp --preserve=mode,timestamps "$dump" "$pg_stage/databases/$db.dump"
-        chown postgres:postgres "$pg_stage/databases/$db.dump"
-        chmod 600 "$pg_stage/databases/$db.dump"
+        # ----------------------------------------------------
+        # Stage dump.
+        # ----------------------------------------------------
+        cp --preserve=mode,timestamps \
+            "$dump" \
+            "$pg_stage/databases/$db.dump"
+
+        chown postgres:postgres \
+            "$pg_stage/databases/$db.dump"
+
+        chmod 600 \
+            "$pg_stage/databases/$db.dump"
+
+        # ----------------------------------------------------
+        # Drop and recreate database.
+        # ----------------------------------------------------
+        log "PostgreSQL [$i/${#dumps[@]}]: recreating database $db"
 
         pg_drop_create_database "$db"
 
+        # ----------------------------------------------------
+        # Restore database.
+        #
+        # --exit-on-error
+        # --no-owner
+        # --no-acl
+        #
+        # Ownership/ACLs are restored through globals.sql
+        # where applicable.
+        # ----------------------------------------------------
         log "PostgreSQL [$i/${#dumps[@]}]: pg_restore $db"
 
-        run_as postgres pg_restore \
+        run_as postgres "$PG_RESTORE_BIN" \
             --exit-on-error \
             --no-owner \
             --no-acl \
@@ -1804,26 +1939,84 @@ restore_postgres() {
             "$pg_stage/databases/$db.dump" ||
             die "PostgreSQL restore failed: $db"
 
+        # ----------------------------------------------------
         # Basic post-restore verification.
-        run_as postgres psql -d "$db" -Atqc "SELECT current_database();" |
+        # ----------------------------------------------------
+        run_as postgres psql \
+            -d "$db" \
+            -Atqc "SELECT current_database();" |
             grep -Fxq "$db" ||
             die "PostgreSQL verification failed: $db"
+
+        # ----------------------------------------------------
+        # Additional basic connectivity verification.
+        # ----------------------------------------------------
+        run_as postgres psql \
+            -d "$db" \
+            -Atqc "SELECT 1;" |
+            grep -Fxq "1" ||
+            die "PostgreSQL connectivity verification failed: $db"
 
         log "PostgreSQL [$i/${#dumps[@]}]: OK"
     done
 
-    log "PostgreSQL restore completed."
+    # ========================================================
+    # FINAL VERSION VERIFICATION
+    # ========================================================
+
+    local final_pg_major=""
+
+    final_pg_major="$(
+        run_as postgres psql \
+            -d postgres \
+            -Atqc "SHOW server_version;" 2>/dev/null |
+            sed 's/^[[:space:]]*//' |
+            sed 's/[[:space:]].*$//' |
+            cut -d. -f1
+    )"
+
+    if [[ "$final_pg_major" != "$REQUIRED_PG_MAJOR" ]]; then
+        die "PostgreSQL final verification failed. Expected major $REQUIRED_PG_MAJOR, found $final_pg_major."
+    fi
+
+    log "PostgreSQL server version verified: PostgreSQL $final_pg_major"
+
+    # --------------------------------------------------------
+    # Cleanup staged dumps.
+    # --------------------------------------------------------
+    rm -rf "$pg_stage"
+
+    log "PostgreSQL restore completed successfully."
 }
- # get pg restore version
+
+
+# ============================================================
+# GET PostgreSQL 18 pg_restore
+# ============================================================
 
 get_pg_restore_bin() {
+
+    local required_major="${1:-18}"
+
     local candidate
     local best=""
-    local best_major=0
     local major
 
-    # Prefer the newest installed pg_restore.
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # Search ONLY for the requested PostgreSQL major version.
+    #
+    # This prevents:
+    #
+    #   PostgreSQL 15 pg_restore
+    #   PostgreSQL 16 pg_restore
+    #   PostgreSQL 17 pg_restore
+    #
+    # from accidentally being selected.
+    # --------------------------------------------------------
     while IFS= read -r candidate; do
+
         [[ -x "$candidate" ]] || continue
 
         major="$(
@@ -1833,25 +2026,44 @@ get_pg_restore_bin() {
 
         [[ "$major" =~ ^[0-9]+$ ]] || continue
 
-        if (( major > best_major )); then
-            best_major="$major"
+        if [[ "$major" == "$required_major" ]]; then
             best="$candidate"
+            break
         fi
+
     done < <(
-        find /usr/lib/postgresql -type f -path '*/bin/pg_restore' \
-            2>/dev/null | sort -V
+        find "/usr/lib/postgresql/$required_major" \
+            -type f \
+            -path '*/bin/pg_restore' \
+            2>/dev/null |
+            sort -V
     )
 
-    # Fallback to PATH version.
-    if [[ -z "$best" ]] && command -v pg_restore >/dev/null 2>&1; then
-        best="$(command -v pg_restore)"
+    # --------------------------------------------------------
+    # Fallback:
+    #
+    # PATH pg_restore is accepted ONLY if it is also the
+    # required major version.
+    # --------------------------------------------------------
+    if [[ -z "$best" ]] &&
+       command -v pg_restore >/dev/null 2>&1; then
+
+        candidate="$(command -v pg_restore)"
+
+        major="$(
+            "$candidate" --version 2>/dev/null |
+                sed -n 's/.*PostgreSQL) \([0-9][0-9]*\).*/\1/p'
+        )"
+
+        if [[ "$major" == "$required_major" ]]; then
+            best="$candidate"
+        fi
     fi
 
     [[ -n "$best" ]] || return 1
 
     printf '%s\n' "$best"
 }
-
 # ---------------------------------------------------------------------------
 # MongoDB
 # ---------------------------------------------------------------------------
