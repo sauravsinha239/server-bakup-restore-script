@@ -682,213 +682,37 @@ restore_backup_apt_sources() {
     [[ "$PACKAGE_MANAGER" == "apt" ]] || return 0
 
     local src="$TREE/APT"
-    local pgdg_dir="/usr/share/postgresql-common/pgdg"
-    local pgdg_key="$pgdg_dir/apt.postgresql.org.asc"
-    local pgdg_key_url="https://www.postgresql.org/media/keys/ACCC4CF8.asc"
 
-    [[ -d "$src" ]] || die "Backup has no APT repository/key metadata: $src"
+    [[ -d "$src" ]] || die "Backup has no APT package metadata: $src"
 
-    validate_backup_apt_os
-
-    log "STEP 2: Restoring OLD server APT sources and signing keys."
+    log "STEP 2: Keeping CURRENT new-server APT sources and signing keys."
+    log "OLD server APT sources/keys will NOT be restored."
 
     # ------------------------------------------------------------
-    # 1. Backup CURRENT new-server APT state for rollback
-    # ------------------------------------------------------------
-    backup_current_apt_state
-
-    # ------------------------------------------------------------
-    # 2. Remove current APT sources and keyrings
-    # ------------------------------------------------------------
-    rm -rf \
-        /etc/apt/sources.list.d \
-        /etc/apt/keyrings \
-        /usr/share/keyrings \
-        /usr/share/postgresql-common/pgdg \
-        /etc/apt/trusted.gpg.d \
-        /etc/apt/preferences.d
-
-    rm -f \
-        /etc/apt/sources.list \
-        /etc/apt/trusted.gpg
-
-    # ------------------------------------------------------------
-    # 3. Re-create APT directories
-    # ------------------------------------------------------------
-    mkdir -p \
-        /etc/apt/sources.list.d \
-        /etc/apt/keyrings \
-        /usr/share/keyrings \
-        "$pgdg_dir" \
-        /etc/apt/trusted.gpg.d \
-        /etc/apt/preferences.d
-
-    # ------------------------------------------------------------
-    # 4. Restore OLD server repository configuration
-    # ------------------------------------------------------------
-    if [[ -f "$src/sources.list" ]]; then
-        cp -a "$src/sources.list" /etc/apt/sources.list
-    fi
-
-    if [[ -d "$src/sources.list.d" ]]; then
-        cp -a "$src/sources.list.d/." /etc/apt/sources.list.d/
-    fi
-
-    # ------------------------------------------------------------
-    # 5. Restore OLD repository keys EXCEPT PGDG
+    # IMPORTANT:
     #
-    # PGDG key is intentionally NOT restored from backup.
-    # It will be freshly installed from PostgreSQL official site.
-    # ------------------------------------------------------------
-    if [[ -d "$src/keyrings" ]]; then
-        cp -a "$src/keyrings/." /usr/share/keyrings/
-        cp -a "$src/keyrings/." /etc/apt/keyrings/
-    fi
-
-    if [[ -d "$src/trusted.gpg.d" ]]; then
-        cp -a "$src/trusted.gpg.d/." /etc/apt/trusted.gpg.d/
-    fi
-
-    if [[ -f "$src/trusted.gpg" ]]; then
-        cp -a "$src/trusted.gpg" /etc/apt/trusted.gpg
-    fi
-
-    if [[ -d "$src/preferences.d" ]]; then
-        cp -a "$src/preferences.d/." /etc/apt/preferences.d/
-    fi
-
-    # ------------------------------------------------------------
-    # 6. Permissions
-    # ------------------------------------------------------------
-    chmod 0644 /etc/apt/sources.list 2>/dev/null || true
-
-    find \
-        /etc/apt/sources.list.d \
-        /etc/apt/keyrings \
-        /usr/share/keyrings \
-        /etc/apt/trusted.gpg.d \
-        /etc/apt/preferences.d \
-        -type f \
-        -exec chmod 0644 {} + \
-        2>/dev/null || true
-
-    # ------------------------------------------------------------
-    # 7. Install curl BEFORE apt-get update.
+    # Do NOT restore any of the following from the old server:
     #
-    # PGDG may currently fail because its old key is missing.
-    # Therefore temporarily disable only PGDG repositories while
-    # installing curl.
+    #   /etc/apt/sources.list
+    #   /etc/apt/sources.list.d/
+    #   /etc/apt/keyrings/
+    #   /usr/share/keyrings/
+    #   /usr/share/postgresql-common/pgdg/
+    #   /etc/apt/trusted.gpg
+    #   /etc/apt/trusted.gpg.d/
+    #   /etc/apt/preferences.d/
+    #
+    # The NEW server keeps its own APT repositories and keys.
     # ------------------------------------------------------------
-    if ! command -v curl >/dev/null 2>&1; then
 
-        log "curl is not installed. Temporarily disabling PGDG repositories."
-
-        local pgdg_disabled_dir="/var/lib/server-restore/pgdg-disabled"
-        rm -rf "$pgdg_disabled_dir"
-        mkdir -p "$pgdg_disabled_dir"
-
-        shopt -s nullglob
-
-        local f
-        for f in /etc/apt/sources.list.d/*.list \
-                 /etc/apt/sources.list.d/*.sources; do
-
-            if grep -qiE 'apt\.postgresql\.org|noble-pgdg|bookworm-pgdg|jammy-pgdg|focal-pgdg' "$f" 2>/dev/null; then
-                mv "$f" "$pgdg_disabled_dir/"
-                log "Temporarily disabled PGDG source: $f"
-            fi
-        done
-
-        shopt -u nullglob
-
-        # Also temporarily disable PGDG lines from sources.list
-        if [[ -f /etc/apt/sources.list ]]; then
-            cp -a /etc/apt/sources.list \
-                "$pgdg_disabled_dir/sources.list"
-
-            sed -i \
-                -E '/apt\.postgresql\.org|[[:space:]]noble-pgdg([[:space:]]|$)|[[:space:]]jammy-pgdg([[:space:]]|$)|[[:space:]]bookworm-pgdg([[:space:]]|$)/s/^/# TEMP-PGDG-DISABLED: /' \
-                /etc/apt/sources.list
-        fi
-
-        log "Installing curl from Ubuntu repositories."
-
-        apt-get update
-
-        apt-get install -y curl || \
-            die "Failed to install curl."
-
-        command -v curl >/dev/null 2>&1 || \
-            die "curl installation failed."
-
-        # Restore PGDG source files
-        if [[ -d "$pgdg_disabled_dir" ]]; then
-            shopt -s nullglob
-
-            for f in "$pgdg_disabled_dir"/*.list \
-                     "$pgdg_disabled_dir"/*.sources; do
-                mv "$f" /etc/apt/sources.list.d/
-            done
-
-            shopt -u nullglob
-        fi
-
-        # Restore original sources.list
-        if [[ -f "$pgdg_disabled_dir/sources.list" ]]; then
-            cp -a "$pgdg_disabled_dir/sources.list" /etc/apt/sources.list
-        fi
-
-        rm -rf "$pgdg_disabled_dir"
-
-        log "curl installed and PGDG repository configuration restored."
-    fi
-
-    # ------------------------------------------------------------
-    # 8. NEVER restore old PGDG key.
-    # Download fresh official PostgreSQL PGDG key.
-    # ------------------------------------------------------------
-    log "Installing fresh official PostgreSQL PGDG signing key."
-
-    rm -f "$pgdg_key"
-
-    curl -fsSL \
-        "$pgdg_key_url" \
-        -o "$pgdg_key" || \
-        die "Failed to download official PostgreSQL PGDG signing key."
-
-    chmod 0644 "$pgdg_key"
-
-    # ------------------------------------------------------------
-    # 9. Verify official PGDG key fingerprint
-    # ------------------------------------------------------------
-    if ! gpg --show-keys --with-fingerprint "$pgdg_key" 2>/dev/null \
-        | grep -q "7FCC 7D46 ACCC 4CF8"; then
-
-        rm -f "$pgdg_key"
-
-        die "Official PostgreSQL PGDG signing key fingerprint verification failed."
-    fi
-
-    log "Official PostgreSQL PGDG signing key verified: 7FCC 7D46 ACCC 4CF8"
-
-    # ------------------------------------------------------------
-    # 10. Final APT update using OLD repositories
-    # and NEW official PGDG key.
-    # ------------------------------------------------------------
-    log "STEP 3: apt-get update using OLD server repositories."
+    log "STEP 3: Updating CURRENT new-server APT repositories."
 
     apt-get update
 
-    # ------------------------------------------------------------
-    # 11. Mark APT restore successful
-    # ------------------------------------------------------------
     APT_BACKUP_RESTORED=1
 
-    log "Old APT repositories restored."
-    log "Old PGDG key ignored."
-    log "Fresh official PostgreSQL PGDG key installed."
-    log "APT package lists updated successfully."
- log "Old APT repositories and signing keys are now active."
+    log "Current new-server APT repositories are active."
+    log "Package installation will use exact versions captured in the backup."
 }
 
 
@@ -1133,28 +957,61 @@ install_exact_apt_packages() {
     done < "$tmp"
     log "STEP 5: Exact package installation completed."
 }
-
 install_selected_packages() {
+
     log "Installing required restore software..."
+
     case "$PACKAGE_MANAGER" in
+
         apt)
+
             export DEBIAN_FRONTEND=noninteractive
-            # REQUIRED ORDER: save current -> restore old repos/keys -> update -> exact install.
+
+            # REQUIRED ORDER:
+            # keep CURRENT new-server repositories/keys
+            # -> apt-get update
+            # -> install exact package versions from backup
+
             restore_backup_apt_sources
+
             install_exact_apt_packages
+
             ;;
+
         pacman)
-            pacman -Sy --noconfirm --needed ca-certificates curl tar gzip rsync
-            [[ "$RESTORE_NGINX" == 1 ]] && pacman -S --noconfirm --needed nginx
-            [[ "$RESTORE_POSTGRES" == 1 ]] && install_postgres
-            [[ "$RESTORE_MONGO" == 1 ]] && install_mongodb
-            [[ "$RESTORE_MSSQL" != 1 ]] || die "MSSQL automatic recovery is not supported from Arch."
+
+            pacman -Sy --noconfirm --needed \
+                ca-certificates curl tar gzip rsync
+
+            [[ "$RESTORE_NGINX" == 1 ]] && \
+                pacman -S --noconfirm --needed nginx
+
+            [[ "$RESTORE_POSTGRES" == 1 ]] && \
+                install_postgres
+
+            [[ "$RESTORE_MONGO" == 1 ]] && \
+                install_mongodb
+
+            [[ "$RESTORE_MSSQL" != 1 ]] || \
+                die "MSSQL automatic recovery is not supported from Arch."
+
             if [[ "$RESTORE_DOCKER" == 1 ]]; then
-                if (( IN_CONTAINER == 1 && DOCKER_SOCKET_AVAILABLE == 0 )); then warn "Docker socket unavailable."; else pacman -S --noconfirm --needed docker; fi
+
+                if (( IN_CONTAINER == 1 && DOCKER_SOCKET_AVAILABLE == 0 )); then
+                    warn "Docker socket unavailable."
+                else
+                    pacman -S --noconfirm --needed docker
+                fi
+
             fi
-            [[ "$RESTORE_SSH" == 1 ]] && pacman -S --noconfirm --needed openssh
+
+            [[ "$RESTORE_SSH" == 1 ]] && \
+                pacman -S --noconfirm --needed openssh
+
             ;;
+
     esac
+
 }
 
 # ---------------------------------------------------------------------------
