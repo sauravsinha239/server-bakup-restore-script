@@ -929,11 +929,7 @@ install_exact_apt_packages() {
     local exact="$TREE/APT/exact-important-packages.txt"
     local legacy="$TREE/PACKAGES/dpkg-packages.txt"
 
-    # ------------------------------------------------------------
-    # Load package inventory
-    # ------------------------------------------------------------
     if [[ ! -f "$exact" ]]; then
-
         warn "Package manifest missing; deriving it from legacy dpkg inventory."
 
         [[ -f "$legacy" ]] || \
@@ -950,92 +946,74 @@ install_exact_apt_packages() {
     fi
 
     log "STEP 4: Selecting packages from old-server package inventory."
-    log "Package sub-version/build numbers will NOT be restored."
+    log "Package patch/build versions will NOT be restored."
+    log "Current versions available in the NEW server repositories will be installed."
 
     local tmp="$RESTORE_ROOT/selected-packages.txt"
-
     : > "$tmp"
 
-    # ------------------------------------------------------------
-    # Select packages
-    # ------------------------------------------------------------
     add_matches() {
         local regex="$1"
 
-        awk -F '\t' \
-            -v re="$regex" \
-            '$1 ~ re {
+        awk -F '\t' -v re="$regex" '
+            $1 ~ re {
                 print $1 "\t" $2
-            }' "$exact" >> "$tmp"
+            }
+        ' "$exact" >> "$tmp"
     }
 
-    # Basic restore tools
-    add_matches '^(ca-certificates|curl|gnupg|tar|gzip|rsync|openssl)$'
+    # Base restore tools
+    add_matches '^(gzip|openssl)$'
 
     # Nginx
-    [[ "$RESTORE_NGINX" == 1 ]] && \
+    if [[ "$RESTORE_NGINX" == 1 ]]; then
         add_matches '^nginx($|-)'
+    fi
 
     # PostgreSQL
-    [[ "$RESTORE_POSTGRES" == 1 ]] && \
+    if [[ "$RESTORE_POSTGRES" == 1 ]]; then
         add_matches '^postgresql($|-)|^postgresql-common$'
+    fi
 
     # MongoDB
-    [[ "$RESTORE_MONGO" == 1 ]] && \
+    if [[ "$RESTORE_MONGO" == 1 ]]; then
         add_matches '^mongodb-'
+    fi
 
-    # Microsoft SQL Server + ODBC
+    # MSSQL
     if [[ "$RESTORE_MSSQL" == 1 ]]; then
         add_matches '^mssql-'
         add_matches '^unixodbc($|-)|^libodbc'
     fi
 
     # CrowdSec
-    [[ "$RESTORE_CROWDSEC" == 1 ]] && \
+    if [[ "$RESTORE_CROWDSEC" == 1 ]]; then
         add_matches '^crowdsec($|-)|^crowdsec-firewall-bouncer'
+    fi
 
     # Docker
-    [[ "$RESTORE_DOCKER" == 1 ]] && \
+    if [[ "$RESTORE_DOCKER" == 1 ]]; then
         add_matches '^docker(-ce)?($|-)|^docker.io$|^containerd($|-)|^runc$'
+    fi
 
     # SSH
-    [[ "$RESTORE_SSH" == 1 ]] && \
+    if [[ "$RESTORE_SSH" == 1 ]]; then
         add_matches '^openssh-server$|^openssh-client$'
+    fi
 
     # Firewall
-    [[ "$RESTORE_FIREWALL" == 1 ]] && \
+    if [[ "$RESTORE_FIREWALL" == 1 ]]; then
         add_matches '^(ufw|iptables|nftables)$'
+    fi
 
     sort -u "$tmp" -o "$tmp"
 
     [[ -s "$tmp" ]] || \
         die "No packages were captured for the selected restore components."
 
-    # ------------------------------------------------------------
-    # Install packages
-    #
-    # IMPORTANT:
-    #
-    # We intentionally DO NOT use:
-    #
-    #     package=old-version
-    #
-    # The old package version is used only to identify the package.
-    # The NEW server's configured repositories provide the version.
-    #
-    # Example:
-    #
-    #   Backup:
-    #       postgresql-18    18.4-1.pgdg24.04+2
-    #
-    #   Restore:
-    #       apt-get install postgresql-18
-    #
-    # This preserves PostgreSQL 18 but ignores 18.4 patch/build.
-    # ------------------------------------------------------------
-
     local pkg
     local old_version
+    local candidate
 
     while IFS=$'\t' read -r pkg old_version; do
 
@@ -1045,7 +1023,7 @@ install_exact_apt_packages() {
 
             postgresql-[0-9]*)
                 log "Installing PostgreSQL package: $pkg"
-                log "Backup version: ${old_version:-unknown} (sub-version ignored)"
+                log "Backup version: ${old_version:-unknown} (patch/build ignored)"
                 ;;
 
             postgresql-common)
@@ -1054,12 +1032,12 @@ install_exact_apt_packages() {
 
             mongodb-*)
                 log "Installing MongoDB package: $pkg"
-                log "Backup version: ${old_version:-unknown} (sub-version ignored)"
+                log "Backup version: ${old_version:-unknown} (patch/build ignored)"
                 ;;
 
             mssql-*)
                 log "Installing MSSQL package: $pkg"
-                log "Backup version: ${old_version:-unknown} (sub-version ignored)"
+                log "Backup version: ${old_version:-unknown} (patch/build ignored)"
                 ;;
 
             nginx|nginx-*)
@@ -1073,34 +1051,48 @@ install_exact_apt_packages() {
             *)
                 log "Installing package: $pkg"
                 ;;
-
         esac
 
-        # --------------------------------------------------------
-        # Check that package exists in CURRENT new-server repos.
-        # --------------------------------------------------------
-        local candidate
+        # ---------------------------------------------------------
+        # IMPORTANT:
+        # Do NOT use awk 'exit' here.
+        #
+        # With:
+        #   set -o pipefail
+        #
+        # awk exiting early can cause apt-cache to receive SIGPIPE
+        # and return 141.
+        #
+        # sed reads the COMPLETE apt-cache output, so no SIGPIPE.
+        # ---------------------------------------------------------
 
         candidate="$(
             apt-cache policy "$pkg" 2>/dev/null |
-            awk -F': ' '/^[[:space:]]*Candidate:/ {
-                print $2
-                exit
-            }'
+            sed -n 's/^[[:space:]]*Candidate:[[:space:]]*//p'
         )"
+
+        # Remove accidental multiple lines, keeping first candidate.
+        candidate="${candidate%%$'\n'*}"
 
         if [[ -z "$candidate" || "$candidate" == "(none)" ]]; then
             die "PACKAGE UNAVAILABLE IN CURRENT REPOSITORIES: $pkg"
         fi
 
-        log "Installing ${pkg}=${candidate}"
+        log "Backup version : ${old_version:-unknown}"
+        log "Current version: ${candidate}"
+        log "Installing     : $pkg"
+        log "Exact old patch/build version will NOT be restored."
 
+        # IMPORTANT:
+        # Install WITHOUT '=old_version'.
+        # APT will choose the version available in the NEW server repos.
         apt-get install -y "$pkg" || \
             die "Package installation failed: $pkg"
 
     done < "$tmp"
 
     log "STEP 5: Package installation completed."
+    log "All selected packages were installed using CURRENT new-server repositories."
 }
 
 
