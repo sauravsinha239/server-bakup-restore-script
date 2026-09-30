@@ -943,9 +943,9 @@ install_exact_apt_packages() {
     [[ "$RESTORE_MONGO" == 1 ]] && add_matches '^mongodb-'
     if [[ "$RESTORE_MSSQL" == 1 ]]; then add_matches '^mssql-'; add_matches '^unixodbc($|-)|^libodbc'; fi
     # [[ "$RESTORE_CROWDSEC" == 1 ]] && add_matches '^crowdsec($|-)|^crowdsec-firewall-bouncer'
-    [[ "$RESTORE_DOCKER" == 1 ]] && add_matches '^docker(-ce)?($|-)|^docker.io$|^containerd($|-)|^runc$'
-    [[ "$RESTORE_SSH" == 1 ]] && add_matches '^openssh-server$|^openssh-client$'
-    [[ "$RESTORE_FIREWALL" == 1 ]] && add_matches '^(ufw|iptables|nftables)$'
+    #[[ "$RESTORE_DOCKER" == 1 ]] && add_matches '^docker(-ce)?($|-)|^docker.io$|^containerd($|-)|^runc$'
+    #[[ "$RESTORE_SSH" == 1 ]] && add_matches '^openssh-server$|^openssh-client$'
+    #[[ "$RESTORE_FIREWALL" == 1 ]] && add_matches '^(ufw|iptables|nftables)$'
     sort -u "$tmp" -o "$tmp"
     [[ -s "$tmp" ]] || die "No exact package versions were captured for selected components."
     local pkg ver
