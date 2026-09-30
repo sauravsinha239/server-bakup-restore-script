@@ -682,6 +682,9 @@ restore_backup_apt_sources() {
     [[ "$PACKAGE_MANAGER" == "apt" ]] || return 0
 
     local src="$TREE/APT"
+    local pgdg_dir="/usr/share/postgresql-common/pgdg"
+    local pgdg_key="$pgdg_dir/apt.postgresql.org.asc"
+    local pgdg_key_url="https://www.postgresql.org/media/keys/ACCC4CF8.asc"
 
     [[ -d "$src" ]] || die "Backup has no APT repository/key metadata: $src"
 
@@ -695,7 +698,7 @@ restore_backup_apt_sources() {
     backup_current_apt_state
 
     # ------------------------------------------------------------
-    # 2. Remove CURRENT new-server APT sources and keyrings
+    # 2. Remove current APT sources and keyrings
     # ------------------------------------------------------------
     rm -rf \
         /etc/apt/sources.list.d \
@@ -716,73 +719,46 @@ restore_backup_apt_sources() {
         /etc/apt/sources.list.d \
         /etc/apt/keyrings \
         /usr/share/keyrings \
-        /usr/share/postgresql-common/pgdg \
+        "$pgdg_dir" \
         /etc/apt/trusted.gpg.d \
         /etc/apt/preferences.d
 
     # ------------------------------------------------------------
-    # 4. Restore OLD server sources.list
+    # 4. Restore OLD server repository configuration
     # ------------------------------------------------------------
     if [[ -f "$src/sources.list" ]]; then
         cp -a "$src/sources.list" /etc/apt/sources.list
     fi
 
-    # ------------------------------------------------------------
-    # 5. Restore OLD server sources.list.d
-    # ------------------------------------------------------------
     if [[ -d "$src/sources.list.d" ]]; then
         cp -a "$src/sources.list.d/." /etc/apt/sources.list.d/
     fi
 
     # ------------------------------------------------------------
-    # 6. Restore OLD server APT keyrings
+    # 5. Restore OLD repository keys EXCEPT PGDG
     #
-    # Backup keyrings are copied to BOTH locations because
-    # different repository configurations may use either path.
+    # PGDG key is intentionally NOT restored from backup.
+    # It will be freshly installed from PostgreSQL official site.
     # ------------------------------------------------------------
     if [[ -d "$src/keyrings" ]]; then
         cp -a "$src/keyrings/." /usr/share/keyrings/
         cp -a "$src/keyrings/." /etc/apt/keyrings/
     fi
 
-    # ------------------------------------------------------------
-    # 7. Restore OLD PostgreSQL PGDG key
-    # ------------------------------------------------------------
-    if [[ -d "$src/postgresql-common-pgdg" ]]; then
-        cp -a \
-            "$src/postgresql-common-pgdg/." \
-            /usr/share/postgresql-common/pgdg/
-    fi
-
-    # ------------------------------------------------------------
-    # 8. Restore OLD trusted.gpg.d
-    # ------------------------------------------------------------
     if [[ -d "$src/trusted.gpg.d" ]]; then
-        cp -a \
-            "$src/trusted.gpg.d/." \
-            /etc/apt/trusted.gpg.d/
+        cp -a "$src/trusted.gpg.d/." /etc/apt/trusted.gpg.d/
     fi
 
-    # ------------------------------------------------------------
-    # 9. Restore OLD trusted.gpg
-    # ------------------------------------------------------------
     if [[ -f "$src/trusted.gpg" ]]; then
-        cp -a \
-            "$src/trusted.gpg" \
-            /etc/apt/trusted.gpg
+        cp -a "$src/trusted.gpg" /etc/apt/trusted.gpg
     fi
 
-    # ------------------------------------------------------------
-    # 10. Restore OLD APT preferences
-    # ------------------------------------------------------------
     if [[ -d "$src/preferences.d" ]]; then
-        cp -a \
-            "$src/preferences.d/." \
-            /etc/apt/preferences.d/
+        cp -a "$src/preferences.d/." /etc/apt/preferences.d/
     fi
 
     # ------------------------------------------------------------
-    # 11. Fix permissions
+    # 6. Permissions
     # ------------------------------------------------------------
     chmod 0644 /etc/apt/sources.list 2>/dev/null || true
 
@@ -790,7 +766,6 @@ restore_backup_apt_sources() {
         /etc/apt/sources.list.d \
         /etc/apt/keyrings \
         /usr/share/keyrings \
-        /usr/share/postgresql-common/pgdg \
         /etc/apt/trusted.gpg.d \
         /etc/apt/preferences.d \
         -type f \
@@ -798,68 +773,123 @@ restore_backup_apt_sources() {
         2>/dev/null || true
 
     # ------------------------------------------------------------
-    # 12. Make sure official PGDG key exists.
+    # 7. Install curl BEFORE apt-get update.
     #
-    # If the backup contains the key, use the backup key.
-    # If it does not, download the official PostgreSQL key.
+    # PGDG may currently fail because its old key is missing.
+    # Therefore temporarily disable only PGDG repositories while
+    # installing curl.
     # ------------------------------------------------------------
-    if [[ ! -s "/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc" ]]; then
+    if ! command -v curl >/dev/null 2>&1; then
 
-        log "PGDG signing key not present in backup."
-        log "Downloading official PostgreSQL PGDG signing key."
+        log "curl is not installed. Temporarily disabling PGDG repositories."
 
-        if ! command -v curl >/dev/null 2>&1; then
-            log "curl is not installed. Installing curl."
+        local pgdg_disabled_dir="/var/lib/server-restore/pgdg-disabled"
+        rm -rf "$pgdg_disabled_dir"
+        mkdir -p "$pgdg_disabled_dir"
 
-            apt-get install -y curl || \
-                die "Failed to install curl."
+        shopt -s nullglob
 
-            command -v curl >/dev/null 2>&1 || \
-                die "curl installation failed."
+        local f
+        for f in /etc/apt/sources.list.d/*.list \
+                 /etc/apt/sources.list.d/*.sources; do
+
+            if grep -qiE 'apt\.postgresql\.org|noble-pgdg|bookworm-pgdg|jammy-pgdg|focal-pgdg' "$f" 2>/dev/null; then
+                mv "$f" "$pgdg_disabled_dir/"
+                log "Temporarily disabled PGDG source: $f"
+            fi
+        done
+
+        shopt -u nullglob
+
+        # Also temporarily disable PGDG lines from sources.list
+        if [[ -f /etc/apt/sources.list ]]; then
+            cp -a /etc/apt/sources.list \
+                "$pgdg_disabled_dir/sources.list"
+
+            sed -i \
+                -E '/apt\.postgresql\.org|[[:space:]]noble-pgdg([[:space:]]|$)|[[:space:]]jammy-pgdg([[:space:]]|$)|[[:space:]]bookworm-pgdg([[:space:]]|$)/s/^/# TEMP-PGDG-DISABLED: /' \
+                /etc/apt/sources.list
         fi
 
-        curl -fsSL \
-            "https://www.postgresql.org/media/keys/ACCC4CF8.asc" \
-            -o "/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc" || \
-            die "Failed to download official PostgreSQL PGDG signing key."
+        log "Installing curl from Ubuntu repositories."
 
-        chmod 0644 \
-            "/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc"
+        apt-get update
 
+        apt-get install -y curl || \
+            die "Failed to install curl."
+
+        command -v curl >/dev/null 2>&1 || \
+            die "curl installation failed."
+
+        # Restore PGDG source files
+        if [[ -d "$pgdg_disabled_dir" ]]; then
+            shopt -s nullglob
+
+            for f in "$pgdg_disabled_dir"/*.list \
+                     "$pgdg_disabled_dir"/*.sources; do
+                mv "$f" /etc/apt/sources.list.d/
+            done
+
+            shopt -u nullglob
+        fi
+
+        # Restore original sources.list
+        if [[ -f "$pgdg_disabled_dir/sources.list" ]]; then
+            cp -a "$pgdg_disabled_dir/sources.list" /etc/apt/sources.list
+        fi
+
+        rm -rf "$pgdg_disabled_dir"
+
+        log "curl installed and PGDG repository configuration restored."
     fi
 
     # ------------------------------------------------------------
-    # 13. Verify PGDG key fingerprint
+    # 8. NEVER restore old PGDG key.
+    # Download fresh official PostgreSQL PGDG key.
     # ------------------------------------------------------------
-    if [[ -s "/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc" ]]; then
+    log "Installing fresh official PostgreSQL PGDG signing key."
 
-        if ! gpg --show-keys --with-fingerprint \
-            "/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc" \
-            2>/dev/null | grep -q "7FCC 7D46 ACCC 4CF8"; then
+    rm -f "$pgdg_key"
 
-            die "PostgreSQL PGDG signing key fingerprint verification failed."
-        fi
+    curl -fsSL \
+        "$pgdg_key_url" \
+        -o "$pgdg_key" || \
+        die "Failed to download official PostgreSQL PGDG signing key."
 
-        log "PostgreSQL PGDG signing key verified: 7FCC 7D46 ACCC 4CF8"
+    chmod 0644 "$pgdg_key"
 
-    else
-        die "PostgreSQL PGDG signing key is missing."
+    # ------------------------------------------------------------
+    # 9. Verify official PGDG key fingerprint
+    # ------------------------------------------------------------
+    if ! gpg --show-keys --with-fingerprint "$pgdg_key" 2>/dev/null \
+        | grep -q "7FCC 7D46 ACCC 4CF8"; then
+
+        rm -f "$pgdg_key"
+
+        die "Official PostgreSQL PGDG signing key fingerprint verification failed."
     fi
 
+    log "Official PostgreSQL PGDG signing key verified: 7FCC 7D46 ACCC 4CF8"
+
     # ------------------------------------------------------------
-    # 14. Update package lists using OLD repositories
+    # 10. Final APT update using OLD repositories
+    # and NEW official PGDG key.
     # ------------------------------------------------------------
     log "STEP 3: apt-get update using OLD server repositories."
 
     apt-get update
 
     # ------------------------------------------------------------
-    # 15. Mark OLD APT state as successfully restored
+    # 11. Mark APT restore successful
     # ------------------------------------------------------------
     APT_BACKUP_RESTORED=1
 
-    log "Old APT repositories and signing keys are now active."
-}
+    log "Old APT repositories restored."
+    log "Old PGDG key ignored."
+    log "Fresh official PostgreSQL PGDG key installed."
+    log "APT package lists updated successfully."
+} log "Old APT repositories and signing keys are now active."
+
 
 apt_restore_sources() {
     [[ "$PACKAGE_MANAGER" == "apt" ]] || return 0
