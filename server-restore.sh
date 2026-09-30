@@ -936,16 +936,22 @@ install_exact_apt_packages() {
     log "STEP 4: Installing EXACT package versions captured from old server."
     local tmp="$RESTORE_ROOT/exact-selected-packages.txt"
     : > "$tmp"
-    add_matches() { local regex="$1"; awk -F '\t' -v re="$regex" '$1 ~ re {print $1 "\t" $2}' "$exact" >> "$tmp"; }
-    add_matches 
-    # [[ "$RESTORE_NGINX" == 1 ]] && add_matches '^nginx($|-)'
-    [[ "$RESTORE_POSTGRES" == 1 ]] && add_matches '^postgresql($|-)|^postgresql-common$'
-    [[ "$RESTORE_MONGO" == 1 ]] && add_matches '^mongodb-'
-    if [[ "$RESTORE_MSSQL" == 1 ]]; then add_matches '^mssql-'; add_matches '^unixodbc($|-)|^libodbc'; fi
-    # [[ "$RESTORE_CROWDSEC" == 1 ]] && add_matches '^crowdsec($|-)|^crowdsec-firewall-bouncer'
-    #[[ "$RESTORE_DOCKER" == 1 ]] && add_matches '^docker(-ce)?($|-)|^docker.io$|^containerd($|-)|^runc$'
-    #[[ "$RESTORE_SSH" == 1 ]] && add_matches '^openssh-server$|^openssh-client$'
-    #[[ "$RESTORE_FIREWALL" == 1 ]] && add_matches '^(ufw|iptables|nftables)$'
+    add_matches() {
+        local regex="$1"
+        awk -F '\t' -v re="$regex" '$1 ~ re {print $1 "\t" $2}' "$exact" >> "$tmp"
+        }
+
+    [[ "$RESTORE_POSTGRES" == 1 ]] && \
+        add_matches '^postgresql($|-)|^postgresql-common$'
+
+    [[ "$RESTORE_MONGO" == 1 ]] && \
+        add_matches '^mongodb-'
+
+    if [[ "$RESTORE_MSSQL" == 1 ]]; then
+        add_matches '^mssql-'
+        add_matches '^unixodbc($|-)|^libodbc'
+    fi
+
     sort -u "$tmp" -o "$tmp"
     [[ -s "$tmp" ]] || die "No exact package versions were captured for selected components."
     local pkg ver
