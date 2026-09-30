@@ -653,10 +653,17 @@ restore_pgdg_official_key() {
 
     install -d -m 0755 "$pgdg_dir"
 
-    if ! cmd curl; then
-        die "curl is required to download the official PostgreSQL PGDG signing key"
+    if ! command -v curl >/dev/null 2>&1; then
+        log "curl is not installed. Installing curl..."
+
+        apt-get install -y curl
+
+    if ! command -v curl >/dev/null 2>&1; then
+        die "Failed to install curl"
     fi
 
+        log "curl installed successfully."
+    fi
     curl -fsSL "$pgdg_key_url" -o "$pgdg_key"
 
     chmod 0644 "$pgdg_key"
