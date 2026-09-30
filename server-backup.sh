@@ -59,7 +59,8 @@ copy_if_exists() {
 # ---------- Package repository / signing-key backup ----------
 backup_package_sources_and_keys() {
   mkdir -p "$TREE/APT" "$TREE/APT/sources.list.d" "$TREE/APT/keyrings" \
-           "$TREE/APT/trusted.gpg.d" "$TREE/APT/preferences.d"
+           "$TREE/APT/trusted.gpg.d" "$TREE/APT/preferences.d" \
+           "$TREE/APT/postgresql-common-pgdg"
 
   # Capture the exact repository definitions used by APT. This is important
   # for vendor repositories such as Microsoft SQL Server, PostgreSQL PGDG,
@@ -75,6 +76,13 @@ backup_package_sources_and_keys() {
   if [[ -d /usr/share/keyrings ]]; then
     # Keep vendor/distribution signing key files available for restore.
     cp -a /usr/share/keyrings/. "$TREE/APT/keyrings/" 2>/dev/null || true
+  fi
+  # PGDG stores its signing key outside the normal APT keyring directories.
+  # Preserve it separately so PostgreSQL repositories can be used before
+  # postgresql-common itself is installed during disaster recovery.
+  if [[ -d /usr/share/postgresql-common/pgdg ]]; then
+    cp -a /usr/share/postgresql-common/pgdg/. \
+      "$TREE/APT/postgresql-common-pgdg/" 2>/dev/null || true
   fi
   if [[ -d /etc/apt/trusted.gpg.d ]]; then
     cp -a /etc/apt/trusted.gpg.d/. "$TREE/APT/trusted.gpg.d/" 2>/dev/null || true
@@ -113,6 +121,15 @@ backup_package_sources_and_keys() {
   # List all key files so restore can verify that the expected signing keys exist.
   find "$TREE/APT/keyrings" "$TREE/APT/trusted.gpg.d" -maxdepth 1 -type f \
     -printf '%P\t%p\n' 2>/dev/null | sort > "$TREE/APT/key-files.txt" || true
+
+  # Capture exact versions of packages that are important for deterministic
+  # disaster recovery. This includes versioned PostgreSQL packages (for
+  # example postgresql-18), MongoDB, MSSQL, Nginx, CrowdSec and their tools.
+  if cmd dpkg-query; then
+    dpkg-query -W -f='${Package}\t${Version}\n' 2>/dev/null | awk -F '\t' '
+      $1 ~ /^(postgresql(-[0-9]+)?|postgresql-client(-[0-9]+)?|postgresql-common|mssql-server|mssql-tools18|mongodb-org($|-)|mongodb-database-tools|nginx($|-)|crowdsec($|-)|crowdsec-firewall-bouncer|fail2ban($|-)|docker(-ce)?($|-)|docker.io($|-)|containerd($|-)|runc($|-)|curl|ca-certificates|gnupg|rsync)$/ {print}
+    ' | sort > "$TREE/APT/exact-important-packages.txt" || true
+  fi
 
   # Record checksums for source/key files. This makes accidental corruption
   # or a changed key obvious before restore.
@@ -395,6 +412,13 @@ ensure_dependencies() {
 }
 
 ensure_dependencies
+
+# Refresh repository/key/package-version capture after dependency provisioning.
+# The first capture happens before installation so the original source state is
+# preserved; this second capture records the final installed package versions.
+if [[ "$DETECTED_OS" == "debian-like" ]] && cmd apt-get; then
+  backup_package_sources_and_keys
+fi
 
 # ========================================================
 # 2. Main Backup Execution
