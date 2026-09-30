@@ -947,10 +947,10 @@ install_exact_apt_packages() {
     [[ "$RESTORE_MONGO" == 1 ]] && \
         add_matches '^mongodb-'
 
-    if [[ "$RESTORE_MSSQL" == 1 ]]; then
-        add_matches '^mssql-'
-        add_matches '^unixodbc($|-)|^libodbc'
-    fi
+    # if [[ "$RESTORE_MSSQL" == 1 ]]; then
+    #     add_matches '^mssql-'
+    #     add_matches '^unixodbc($|-)|^libodbc'
+    # fi
 
     sort -u "$tmp" -o "$tmp"
     [[ -s "$tmp" ]] || die "No exact package versions were captured for selected components."
