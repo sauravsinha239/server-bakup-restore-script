@@ -942,7 +942,7 @@ install_exact_apt_packages() {
     awk -F '\t' -v re="$regex" '$1 ~ re {print $1 "\t" $2}' "$exact" >> "$tmp"
 }
 
-add_matches '^(curl|gnupg|tar|gzip|rsync|openssl)$'
+add_matches '^(openssl)$'
 
 [[ "$RESTORE_NGINX" == 1 ]] && \
     add_matches '^nginx($|-)'
