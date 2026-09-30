@@ -1086,8 +1086,12 @@ install_exact_apt_packages() {
         # IMPORTANT:
         # Install WITHOUT '=old_version'.
         # APT will choose the version available in the NEW server repos.
-        apt-get install -y "$pkg" || \
-            die "Package installation failed: $pkg"
+       DEBIAN_FRONTEND=noninteractive \
+apt-get install -y \
+    -o Dpkg::Options::="--force-confold" \
+    -o Dpkg::Options::="--force-confdef" \
+    "$pkg" || \
+    die "Package installation failed: $pkg"
 
     done < "$tmp"
 
