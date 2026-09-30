@@ -644,6 +644,32 @@ validate_backup_apt_os() {
     fi
 }
 
+restore_pgdg_official_key() {
+    log "Restoring official PostgreSQL PGDG signing key..."
+
+    local pgdg_dir="/usr/share/postgresql-common/pgdg"
+    local pgdg_key="${pgdg_dir}/apt.postgresql.org.asc"
+    local pgdg_key_url="https://www.postgresql.org/media/keys/ACCC4CF8.asc"
+
+    install -d -m 0755 "$pgdg_dir"
+
+    if ! cmd curl; then
+        die "curl is required to download the official PostgreSQL PGDG signing key"
+    fi
+
+    curl -fsSL "$pgdg_key_url" -o "$pgdg_key"
+
+    chmod 0644 "$pgdg_key"
+
+    if ! gpg --show-keys --with-fingerprint "$pgdg_key" 2>/dev/null \
+        | grep -q "7FCC 7D46 ACCC 4CF8"; then
+        rm -f "$pgdg_key"
+        die "Downloaded PostgreSQL PGDG signing key fingerprint verification failed"
+    fi
+
+    log "Official PostgreSQL PGDG signing key installed and verified."
+}
+
 restore_backup_apt_sources() {
     [[ "$PACKAGE_MANAGER" == "apt" ]] || return 0
     local src="$TREE/APT"
@@ -666,6 +692,11 @@ restore_backup_apt_sources() {
     [[ ! -d "$src/preferences.d" ]] || cp -a "$src/preferences.d/." /etc/apt/preferences.d/
     chmod 0644 /etc/apt/sources.list 2>/dev/null || true
     find /etc/apt/sources.list.d /etc/apt/keyrings /usr/share/keyrings /usr/share/postgresql-common/pgdg /etc/apt/trusted.gpg.d /etc/apt/preferences.d -type f -exec chmod 0644 {} + 2>/dev/null || true
+    log "STEP 3: apt-get update using OLD server repositories."
+
+restore_pgdg_official_key
+
+apt-get update
     log "STEP 3: apt-get update using OLD server repositories."
     apt-get update
     APT_BACKUP_RESTORED=1
