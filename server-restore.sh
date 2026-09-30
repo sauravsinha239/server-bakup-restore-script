@@ -936,33 +936,110 @@ install_exact_apt_packages() {
     log "STEP 4: Installing EXACT package versions captured from old server."
     local tmp="$RESTORE_ROOT/exact-selected-packages.txt"
     : > "$tmp"
+    add_matches() { local regex="$1"; awk -F '\t' -v re="$regex" '$1 ~ re {print $1 "\t" $2}' "$exact" >> "$tmp"; }
     add_matches() {
-        local regex="$1"
-        awk -F '\t' -v re="$regex" '$1 ~ re {print $1 "\t" $2}' "$exact" >> "$tmp"
-        }
-
-    [[ "$RESTORE_POSTGRES" == 1 ]] && \
-        add_matches '^postgresql($|-)|^postgresql-common$'
-
-    [[ "$RESTORE_MONGO" == 1 ]] && \
-        add_matches '^mongodb-'
-
-    # if [[ "$RESTORE_MSSQL" == 1 ]]; then
-    #     add_matches '^mssql-'
-    #     add_matches '^unixodbc($|-)|^libodbc'
-    # fi
-
-    sort -u "$tmp" -o "$tmp"
-    [[ -s "$tmp" ]] || die "No exact package versions were captured for selected components."
-    local pkg ver
-    while IFS=$'\t' read -r pkg ver; do
-        [[ -n "$pkg" && -n "$ver" ]] || continue
-        apt-cache policy "$pkg" 2>/dev/null | grep -Fq "$ver" || die "EXACT VERSION UNAVAILABLE: ${pkg}=${ver}. Refusing a different version."
-        log "Installing exact: ${pkg}=${ver}"
-        apt-get install -y --allow-downgrades "${pkg}=${ver}" || die "Exact installation failed: ${pkg}=${ver}"
-    done < "$tmp"
-    log "STEP 5: Exact package installation completed."
+    local regex="$1"
+    awk -F '\t' -v re="$regex" '$1 ~ re {print $1 "\t" $2}' "$exact" >> "$tmp"
 }
+
+add_matches '^(ca-certificates|curl|gnupg|tar|gzip|rsync|openssl)$'
+
+[[ "$RESTORE_NGINX" == 1 ]] && \
+    add_matches '^nginx($|-)'
+
+[[ "$RESTORE_POSTGRES" == 1 ]] && \
+    add_matches '^postgresql($|-)|^postgresql-common$'
+
+[[ "$RESTORE_MONGO" == 1 ]] && \
+    add_matches '^mongodb-'
+
+if [[ "$RESTORE_MSSQL" == 1 ]]; then
+    add_matches '^mssql-'
+    add_matches '^unixodbc($|-)|^libodbc'
+fi
+
+[[ "$RESTORE_CROWDSEC" == 1 ]] && \
+    add_matches '^crowdsec($|-)|^crowdsec-firewall-bouncer'
+
+[[ "$RESTORE_DOCKER" == 1 ]] && \
+    add_matches '^docker(-ce)?($|-)|^docker.io$|^containerd($|-)|^runc$'
+
+[[ "$RESTORE_SSH" == 1 ]] && \
+    add_matches '^openssh-server$|^openssh-client$'
+
+[[ "$RESTORE_FIREWALL" == 1 ]] && \
+    add_matches '^(ufw|iptables|nftables)$'
+
+sort -u "$tmp" -o "$tmp"
+[[ -s "$tmp" ]] || die "No package versions were captured for selected components."
+
+local pkg ver major_version
+while IFS=$'\t' read -r pkg ver; do
+
+    [[ -n "$pkg" && -n "$ver" ]] || continue
+
+    # ------------------------------------------------------------
+    # We do NOT restore the exact patch/build version.
+    #
+    # Example:
+    #
+    #   Backup: postgresql-18 = 18.4-1.pgdg24.04+2
+    #
+    #   Restore: install available postgresql-18
+    #
+    # The package name itself preserves the major version.
+    # ------------------------------------------------------------
+
+    case "$pkg" in
+
+        postgresql-*)
+            major_version="${pkg#postgresql-}"
+
+            if [[ "$major_version" =~ ^[0-9]+$ ]]; then
+                log "Installing PostgreSQL major version ${major_version}: ${pkg}"
+            fi
+            ;;
+
+        mongodb-*)
+            log "Installing MongoDB package: ${pkg}"
+            ;;
+
+        mssql-*)
+            log "Installing MSSQL package: ${pkg}"
+            ;;
+
+        nginx|nginx-*)
+            log "Installing Nginx package: ${pkg}"
+            ;;
+
+        crowdsec|crowdsec-*)
+            log "Installing CrowdSec package: ${pkg}"
+            ;;
+
+        *)
+            log "Installing package: ${pkg}"
+            ;;
+
+    esac
+
+    # ------------------------------------------------------------
+    # Install the currently available version from the NEW server's
+    # configured repositories.
+    #
+    # No package=old-version is used.
+    # ------------------------------------------------------------
+
+    apt-cache policy "$pkg" 2>/dev/null | grep -q 'Candidate:' || \
+        die "PACKAGE UNAVAILABLE: ${pkg}"
+
+    apt-get install -y "$pkg" || \
+        die "Package installation failed: ${pkg}"
+
+done < "$tmp"
+
+log "STEP 5: Package installation completed using available repository versions."
+}
+
 install_selected_packages() {
 
     log "Installing required restore software..."
@@ -973,13 +1050,13 @@ install_selected_packages() {
 
             export DEBIAN_FRONTEND=noninteractive
 
-            # REQUIRED ORDER:
-            # keep CURRENT new-server repositories/keys
-            # -> apt-get update
-            # -> install exact package versions from backup
-
+            # Keep CURRENT new-server APT repositories and keys.
+            # Do not restore old server APT sources or keys.
             restore_backup_apt_sources
 
+            # Install packages using the major/package identity
+            # captured from the old server, but use the currently
+            # available repository version.
             install_exact_apt_packages
 
             ;;
@@ -1017,7 +1094,6 @@ install_selected_packages() {
             ;;
 
     esac
-
 }
 
 # ---------------------------------------------------------------------------
