@@ -678,35 +678,186 @@ restore_pgdg_official_key() {
 }
 
 restore_backup_apt_sources() {
+
     [[ "$PACKAGE_MANAGER" == "apt" ]] || return 0
+
     local src="$TREE/APT"
+
     [[ -d "$src" ]] || die "Backup has no APT repository/key metadata: $src"
+
     validate_backup_apt_os
+
     log "STEP 2: Restoring OLD server APT sources and signing keys."
+
+    # ------------------------------------------------------------
+    # 1. Backup CURRENT new-server APT state for rollback
+    # ------------------------------------------------------------
     backup_current_apt_state
-    rm -rf /etc/apt/sources.list.d /etc/apt/keyrings /usr/share/keyrings /usr/share/postgresql-common/pgdg /etc/apt/trusted.gpg.d /etc/apt/preferences.d
-    rm -f /etc/apt/sources.list /etc/apt/trusted.gpg
-    mkdir -p /etc/apt/sources.list.d /etc/apt/keyrings /usr/share/keyrings /usr/share/postgresql-common/pgdg /etc/apt/trusted.gpg.d /etc/apt/preferences.d
-    [[ ! -f "$src/sources.list" ]] || cp -a "$src/sources.list" /etc/apt/sources.list
-    [[ ! -d "$src/sources.list.d" ]] || cp -a "$src/sources.list.d/." /etc/apt/sources.list.d/
-    [[ ! -d "$src/keyrings" ]] || { cp -a "$src/keyrings/." /usr/share/keyrings/; cp -a "$src/keyrings/." /etc/apt/keyrings/; }
-    # PGDG signing key is stored outside normal APT keyring directories.
-    if [[ -d "$src/postgresql-common-pgdg" ]]; then
-        cp -a "$src/postgresql-common-pgdg/." /usr/share/postgresql-common/pgdg/
+
+    # ------------------------------------------------------------
+    # 2. Remove CURRENT new-server APT sources and keyrings
+    # ------------------------------------------------------------
+    rm -rf \
+        /etc/apt/sources.list.d \
+        /etc/apt/keyrings \
+        /usr/share/keyrings \
+        /usr/share/postgresql-common/pgdg \
+        /etc/apt/trusted.gpg.d \
+        /etc/apt/preferences.d
+
+    rm -f \
+        /etc/apt/sources.list \
+        /etc/apt/trusted.gpg
+
+    # ------------------------------------------------------------
+    # 3. Re-create APT directories
+    # ------------------------------------------------------------
+    mkdir -p \
+        /etc/apt/sources.list.d \
+        /etc/apt/keyrings \
+        /usr/share/keyrings \
+        /usr/share/postgresql-common/pgdg \
+        /etc/apt/trusted.gpg.d \
+        /etc/apt/preferences.d
+
+    # ------------------------------------------------------------
+    # 4. Restore OLD server sources.list
+    # ------------------------------------------------------------
+    if [[ -f "$src/sources.list" ]]; then
+        cp -a "$src/sources.list" /etc/apt/sources.list
     fi
-    [[ ! -d "$src/trusted.gpg.d" ]] || cp -a "$src/trusted.gpg.d/." /etc/apt/trusted.gpg.d/
-    [[ ! -f "$src/trusted.gpg" ]] || cp -a "$src/trusted.gpg" /etc/apt/trusted.gpg
-    [[ ! -d "$src/preferences.d" ]] || cp -a "$src/preferences.d/." /etc/apt/preferences.d/
+
+    # ------------------------------------------------------------
+    # 5. Restore OLD server sources.list.d
+    # ------------------------------------------------------------
+    if [[ -d "$src/sources.list.d" ]]; then
+        cp -a "$src/sources.list.d/." /etc/apt/sources.list.d/
+    fi
+
+    # ------------------------------------------------------------
+    # 6. Restore OLD server APT keyrings
+    #
+    # Backup keyrings are copied to BOTH locations because
+    # different repository configurations may use either path.
+    # ------------------------------------------------------------
+    if [[ -d "$src/keyrings" ]]; then
+        cp -a "$src/keyrings/." /usr/share/keyrings/
+        cp -a "$src/keyrings/." /etc/apt/keyrings/
+    fi
+
+    # ------------------------------------------------------------
+    # 7. Restore OLD PostgreSQL PGDG key
+    # ------------------------------------------------------------
+    if [[ -d "$src/postgresql-common-pgdg" ]]; then
+        cp -a \
+            "$src/postgresql-common-pgdg/." \
+            /usr/share/postgresql-common/pgdg/
+    fi
+
+    # ------------------------------------------------------------
+    # 8. Restore OLD trusted.gpg.d
+    # ------------------------------------------------------------
+    if [[ -d "$src/trusted.gpg.d" ]]; then
+        cp -a \
+            "$src/trusted.gpg.d/." \
+            /etc/apt/trusted.gpg.d/
+    fi
+
+    # ------------------------------------------------------------
+    # 9. Restore OLD trusted.gpg
+    # ------------------------------------------------------------
+    if [[ -f "$src/trusted.gpg" ]]; then
+        cp -a \
+            "$src/trusted.gpg" \
+            /etc/apt/trusted.gpg
+    fi
+
+    # ------------------------------------------------------------
+    # 10. Restore OLD APT preferences
+    # ------------------------------------------------------------
+    if [[ -d "$src/preferences.d" ]]; then
+        cp -a \
+            "$src/preferences.d/." \
+            /etc/apt/preferences.d/
+    fi
+
+    # ------------------------------------------------------------
+    # 11. Fix permissions
+    # ------------------------------------------------------------
     chmod 0644 /etc/apt/sources.list 2>/dev/null || true
-    find /etc/apt/sources.list.d /etc/apt/keyrings /usr/share/keyrings /usr/share/postgresql-common/pgdg /etc/apt/trusted.gpg.d /etc/apt/preferences.d -type f -exec chmod 0644 {} + 2>/dev/null || true
+
+    find \
+        /etc/apt/sources.list.d \
+        /etc/apt/keyrings \
+        /usr/share/keyrings \
+        /usr/share/postgresql-common/pgdg \
+        /etc/apt/trusted.gpg.d \
+        /etc/apt/preferences.d \
+        -type f \
+        -exec chmod 0644 {} + \
+        2>/dev/null || true
+
+    # ------------------------------------------------------------
+    # 12. Make sure official PGDG key exists.
+    #
+    # If the backup contains the key, use the backup key.
+    # If it does not, download the official PostgreSQL key.
+    # ------------------------------------------------------------
+    if [[ ! -s "/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc" ]]; then
+
+        log "PGDG signing key not present in backup."
+        log "Downloading official PostgreSQL PGDG signing key."
+
+        if ! command -v curl >/dev/null 2>&1; then
+            log "curl is not installed. Installing curl."
+
+            apt-get install -y curl || \
+                die "Failed to install curl."
+
+            command -v curl >/dev/null 2>&1 || \
+                die "curl installation failed."
+        fi
+
+        curl -fsSL \
+            "https://www.postgresql.org/media/keys/ACCC4CF8.asc" \
+            -o "/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc" || \
+            die "Failed to download official PostgreSQL PGDG signing key."
+
+        chmod 0644 \
+            "/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc"
+
+    fi
+
+    # ------------------------------------------------------------
+    # 13. Verify PGDG key fingerprint
+    # ------------------------------------------------------------
+    if [[ -s "/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc" ]]; then
+
+        if ! gpg --show-keys --with-fingerprint \
+            "/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc" \
+            2>/dev/null | grep -q "7FCC 7D46 ACCC 4CF8"; then
+
+            die "PostgreSQL PGDG signing key fingerprint verification failed."
+        fi
+
+        log "PostgreSQL PGDG signing key verified: 7FCC 7D46 ACCC 4CF8"
+
+    else
+        die "PostgreSQL PGDG signing key is missing."
+    fi
+
+    # ------------------------------------------------------------
+    # 14. Update package lists using OLD repositories
+    # ------------------------------------------------------------
     log "STEP 3: apt-get update using OLD server repositories."
 
-restore_pgdg_official_key
-
-apt-get update
-    log "STEP 3: apt-get update using OLD server repositories."
     apt-get update
+
+    # ------------------------------------------------------------
+    # 15. Mark OLD APT state as successfully restored
+    # ------------------------------------------------------------
     APT_BACKUP_RESTORED=1
+
     log "Old APT repositories and signing keys are now active."
 }
 
