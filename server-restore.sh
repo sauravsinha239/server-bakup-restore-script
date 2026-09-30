@@ -938,7 +938,7 @@ install_exact_apt_packages() {
     : > "$tmp"
     add_matches() { local regex="$1"; awk -F '\t' -v re="$regex" '$1 ~ re {print $1 "\t" $2}' "$exact" >> "$tmp"; }
     add_matches '^(ca-certificates|curl|gnupg|tar|gzip|rsync|openssl)$'
-    [[ "$RESTORE_NGINX" == 1 ]] && add_matches '^nginx($|-)'
+    # [[ "$RESTORE_NGINX" == 1 ]] && add_matches '^nginx($|-)'
     [[ "$RESTORE_POSTGRES" == 1 ]] && add_matches '^postgresql($|-)|^postgresql-common$'
     [[ "$RESTORE_MONGO" == 1 ]] && add_matches '^mongodb-'
     if [[ "$RESTORE_MSSQL" == 1 ]]; then add_matches '^mssql-'; add_matches '^unixodbc($|-)|^libodbc'; fi
