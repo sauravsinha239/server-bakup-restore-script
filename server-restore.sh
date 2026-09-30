@@ -651,17 +651,21 @@ restore_backup_apt_sources() {
     validate_backup_apt_os
     log "STEP 2: Restoring OLD server APT sources and signing keys."
     backup_current_apt_state
-    rm -rf /etc/apt/sources.list.d /etc/apt/keyrings /usr/share/keyrings /etc/apt/trusted.gpg.d /etc/apt/preferences.d
+    rm -rf /etc/apt/sources.list.d /etc/apt/keyrings /usr/share/keyrings /usr/share/postgresql-common/pgdg /etc/apt/trusted.gpg.d /etc/apt/preferences.d
     rm -f /etc/apt/sources.list /etc/apt/trusted.gpg
-    mkdir -p /etc/apt/sources.list.d /etc/apt/keyrings /usr/share/keyrings /etc/apt/trusted.gpg.d /etc/apt/preferences.d
+    mkdir -p /etc/apt/sources.list.d /etc/apt/keyrings /usr/share/keyrings /usr/share/postgresql-common/pgdg /etc/apt/trusted.gpg.d /etc/apt/preferences.d
     [[ ! -f "$src/sources.list" ]] || cp -a "$src/sources.list" /etc/apt/sources.list
     [[ ! -d "$src/sources.list.d" ]] || cp -a "$src/sources.list.d/." /etc/apt/sources.list.d/
     [[ ! -d "$src/keyrings" ]] || { cp -a "$src/keyrings/." /usr/share/keyrings/; cp -a "$src/keyrings/." /etc/apt/keyrings/; }
+    # PGDG signing key is stored outside normal APT keyring directories.
+    if [[ -d "$src/postgresql-common-pgdg" ]]; then
+        cp -a "$src/postgresql-common-pgdg/." /usr/share/postgresql-common/pgdg/
+    fi
     [[ ! -d "$src/trusted.gpg.d" ]] || cp -a "$src/trusted.gpg.d/." /etc/apt/trusted.gpg.d/
     [[ ! -f "$src/trusted.gpg" ]] || cp -a "$src/trusted.gpg" /etc/apt/trusted.gpg
     [[ ! -d "$src/preferences.d" ]] || cp -a "$src/preferences.d/." /etc/apt/preferences.d/
     chmod 0644 /etc/apt/sources.list 2>/dev/null || true
-    find /etc/apt/sources.list.d /etc/apt/keyrings /usr/share/keyrings /etc/apt/trusted.gpg.d /etc/apt/preferences.d -type f -exec chmod 0644 {} + 2>/dev/null || true
+    find /etc/apt/sources.list.d /etc/apt/keyrings /usr/share/keyrings /usr/share/postgresql-common/pgdg /etc/apt/trusted.gpg.d /etc/apt/preferences.d -type f -exec chmod 0644 {} + 2>/dev/null || true
     log "STEP 3: apt-get update using OLD server repositories."
     apt-get update
     APT_BACKUP_RESTORED=1
