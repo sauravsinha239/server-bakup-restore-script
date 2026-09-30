@@ -7,7 +7,7 @@ umask 077
 # and prompts interactively for usernames (with Enter for default) and passwords.
 # Run as root.
 
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.7.0"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/backup.conf}"
 
@@ -56,7 +56,140 @@ copy_if_exists() {
   mkdir -p "$(dirname "$TREE/$dst")"
   cp -a "$src" "$TREE/$dst"
 }
+# ---------- Package repository / signing-key backup ----------
+backup_package_sources_and_keys() {
+  mkdir -p "$TREE/APT" "$TREE/APT/sources.list.d" "$TREE/APT/keyrings" \
+           "$TREE/APT/trusted.gpg.d" "$TREE/APT/preferences.d"
 
+  # Capture the exact repository definitions used by APT. This is important
+  # for vendor repositories such as Microsoft SQL Server, PostgreSQL PGDG,
+  # MongoDB, Nginx and CrowdSec, where the distro repository may not contain
+  # the same major/minor version later.
+  copy_if_exists /etc/apt/sources.list APT/sources.list
+  if [[ -d /etc/apt/sources.list.d ]]; then
+    cp -a /etc/apt/sources.list.d/. "$TREE/APT/sources.list.d/" 2>/dev/null || true
+  fi
+  if [[ -d /etc/apt/keyrings ]]; then
+    cp -a /etc/apt/keyrings/. "$TREE/APT/keyrings/" 2>/dev/null || true
+  fi
+  if [[ -d /usr/share/keyrings ]]; then
+    # Keep vendor/distribution signing key files available for restore.
+    cp -a /usr/share/keyrings/. "$TREE/APT/keyrings/" 2>/dev/null || true
+  fi
+  if [[ -d /etc/apt/trusted.gpg.d ]]; then
+    cp -a /etc/apt/trusted.gpg.d/. "$TREE/APT/trusted.gpg.d/" 2>/dev/null || true
+  fi
+  if [[ -f /etc/apt/trusted.gpg ]]; then
+    cp -a /etc/apt/trusted.gpg "$TREE/APT/trusted.gpg"
+  fi
+  if [[ -d /etc/apt/preferences.d ]]; then
+    cp -a /etc/apt/preferences.d/. "$TREE/APT/preferences.d/" 2>/dev/null || true
+  fi
+  # Intentionally do NOT copy /etc/apt/auth.conf or auth.conf.d: those files
+  # may contain private repository credentials. Repository definitions and
+  # signing keys are sufficient for normal public vendor repositories.
+
+  # Human-readable and machine-readable repository inventory.
+  {
+    echo "=== APT SOURCES ==="
+    [[ -f /etc/apt/sources.list ]] && cat /etc/apt/sources.list
+    find /etc/apt/sources.list.d -maxdepth 1 -type f \
+      \( -name '*.list' -o -name '*.sources' \) -print -exec sh -c 'echo; echo "### $1"; cat "$1"' _ {} \; 2>/dev/null || true
+    echo
+    echo "=== APT POLICY FOR IMPORTANT PACKAGES ==="
+    for pkg in postgresql postgresql-common postgresql-client mssql-server mongodb-org mongodb-org-server mongodb-database-tools nginx crowdsec crowdsec-firewall-bouncer; do
+      echo
+      echo "### $pkg"
+      apt-cache policy "$pkg" 2>/dev/null || true
+    done
+  } > "$TREE/APT/repositories-and-package-policy.txt"
+
+  # Export the complete legacy trusted keyring too, when apt-key exists.
+  # Do not fail the backup on newer systems where apt-key has been removed.
+  if cmd apt-key; then
+    apt-key exportall > "$TREE/APT/apt-key-exportall.gpg" 2>/dev/null || true
+  fi
+
+  # List all key files so restore can verify that the expected signing keys exist.
+  find "$TREE/APT/keyrings" "$TREE/APT/trusted.gpg.d" -maxdepth 1 -type f \
+    -printf '%P\t%p\n' 2>/dev/null | sort > "$TREE/APT/key-files.txt" || true
+
+  # Record checksums for source/key files. This makes accidental corruption
+  # or a changed key obvious before restore.
+  find "$TREE/APT" -type f \
+    \( -name '*.list' -o -name '*.sources' -o -name '*.gpg' -o -name '*.asc' -o -name '*.key' \) \
+    -print0 2>/dev/null | xargs -0 -r sha256sum > "$TREE/APT/source-key-sha256.txt" || true
+}
+
+# ---------- Version / restore metadata helpers ----------
+record_tool_metadata() {
+  mkdir -p "$TREE/METADATA"
+  {
+    echo "backup_script_version=$SCRIPT_VERSION"
+    echo "backup_timestamp=$(date --iso-8601=seconds)"
+    echo "hostname=$HOST"
+    echo "os_id=${ID:-unknown}"
+    echo "os_version=${VERSION_ID:-unknown}"
+    echo "os_pretty_name=${PRETTY_NAME:-unknown}"
+    echo "kernel=$(uname -r)"
+    echo "architecture=$(uname -m)"
+    echo
+    echo "[tools]"
+    for tool in nginx psql pg_dump pg_dumpall pg_isready mongodump mongorestore mongosh mongod sqlcmd cscli docker dotnet node npm python3 java sshd ufw fail2ban; do
+      if cmd "$tool"; then
+        case "$tool" in
+          nginx) ver="$(nginx -v 2>&1 | sed 's/^nginx version: //')" ;;
+          psql|pg_dump|pg_dumpall|pg_isready) ver="$("$tool" --version 2>&1)" ;;
+          mongodump|mongorestore|mongod) ver="$("$tool" --version 2>&1 | head -n 1)" ;;
+          mongosh) ver="$(mongosh --version 2>&1)" ;;
+          sqlcmd) ver="$(sqlcmd --version 2>&1 | head -n 1)" ;;
+          cscli) ver="$(cscli version 2>&1 | head -n 1)" ;;
+          docker) ver="$(docker --version 2>&1)" ;;
+          dotnet) ver="$(dotnet --version 2>&1)" ;;
+          node) ver="$(node --version 2>&1)" ;;
+          npm) ver="$(npm --version 2>&1)" ;;
+          python3) ver="$(python3 --version 2>&1)" ;;
+          java) ver="$(java -version 2>&1 | head -n 1)" ;;
+          sshd) ver="$(sshd -V 2>&1 | head -n 1)" ;;
+          ufw) ver="$(ufw version 2>&1 | head -n 1)" ;;
+          fail2ban) ver="$(fail2ban-client --version 2>&1 | head -n 1)" ;;
+        esac
+        printf '%s\t%s\n' "$tool" "$ver"
+      else
+        printf '%s\tNOT-INSTALLED\n' "$tool"
+      fi
+    done
+    echo
+    echo "[packages]"
+    if cmd dpkg-query; then
+      for pkg in nginx nginx-common postgresql postgresql-common postgresql-client mssql-server mongodb-org mongodb-org-server mongodb-database-tools crowdsec crowdsec-firewall-bouncer fail2ban docker-ce docker.io; do
+        dpkg-query -W -f='${Package}\t${Version}\n' "$pkg" 2>/dev/null || true
+      done
+    elif cmd pacman; then
+      for pkg in nginx postgresql mongodb-tools crowdsec fail2ban docker; do
+        pacman -Q "$pkg" 2>/dev/null || true
+      done
+    fi
+  } > "$TREE/METADATA/tool-versions.txt"
+
+  {
+    printf 'BACKUP_SCRIPT_VERSION=%q\n' "$SCRIPT_VERSION"
+    printf 'BACKUP_TIMESTAMP=%q\n' "$(date --iso-8601=seconds)"
+    printf 'HOSTNAME=%q\n' "$HOST"
+    printf 'OS_ID=%q\n' "${ID:-unknown}"
+    printf 'OS_VERSION=%q\n' "${VERSION_ID:-unknown}"
+    printf 'OS_PRETTY_NAME=%q\n' "${PRETTY_NAME:-unknown}"
+    printf 'KERNEL=%q\n' "$(uname -r)"
+    printf 'ARCH=%q\n' "$(uname -m)"
+    if cmd nginx; then printf 'NGINX_VERSION=%q\n' "$(nginx -v 2>&1 | sed 's/^nginx version: //')"; fi
+    if cmd psql; then printf 'PSQL_VERSION=%q\n' "$(psql --version 2>&1)"; fi
+    if cmd mongosh; then printf 'MONGOSH_VERSION=%q\n' "$(mongosh --version 2>&1)"; fi
+    if cmd cscli; then printf 'CROWDSEC_VERSION=%q\n' "$(cscli version 2>&1 | head -n 1)"; fi
+    if cmd sqlcmd; then printf 'SQLCMD_VERSION=%q\n' "$(sqlcmd --version 2>&1 | head -n 1)"; fi
+    if cmd apt-get; then printf 'APT_VERSION=%q\n' "$(apt-get --version 2>&1 | head -n 1)"; fi
+    if cmd dpkg; then printf 'DPKG_VERSION=%q\n' "$(dpkg --version 2>&1 | head -n 1)"; fi
+  } > "$TREE/METADATA/tool-versions.env"
+}
 is_port_open() {
   local host="$1" port="$2"
   (exec 3<>"/dev/tcp/${host}/${port}") >/dev/null 2>&1 && { exec 3>&-; exec 3<&-; return 0; } || return 1
@@ -186,6 +319,11 @@ install_standalone_mongodump() {
   fi
   rm -rf "$tmp_dir"
 }
+
+# ---------- APT repositories, vendor sources and signing keys ----------
+if [[ "$DETECTED_OS" == "debian-like" ]] && cmd apt-get; then
+  backup_package_sources_and_keys
+fi
 
 ensure_dependencies() {
   log "Verifying system requirements and database CLI tools..."
@@ -410,6 +548,33 @@ if cmd psql || cmd pg_dump || cmd pg_dumpall || [[ -d /etc/postgresql ]]; then
       die "PostgreSQL authentication/connection failed for user '$PG_USER' using database '$PGDATABASE'. Aborting backup."
     fi
 
+    psql -AtX -d "$PGDATABASE" -c "SHOW server_version;" > "$TREE/POSTGRES/server-version.txt"
+    psql -AtX -d "$PGDATABASE" -c "SELECT current_setting('server_version_num');" > "$TREE/POSTGRES/server-version-num.txt"
+
+    # Record the default PostgreSQL account and enable LOGIN if necessary.
+    # The original state is retained for restoration.
+    PG_DEFAULT_ROLE_FILE="$TREE/POSTGRES/postgres-role-state.txt"
+    if psql -AtX -d "$PGDATABASE" -c "SELECT 1 FROM pg_roles WHERE rolname='postgres';" | grep -q '^1$'; then
+      PG_POSTGRES_CANLOGIN="$(psql -AtX -d "$PGDATABASE" -c "SELECT rolcanlogin FROM pg_roles WHERE rolname='postgres';")"
+      PG_POSTGRES_SUPERUSER="$(psql -AtX -d "$PGDATABASE" -c "SELECT rolsuper FROM pg_roles WHERE rolname='postgres';")"
+      {
+        echo "role=postgres"
+        echo "original_rolcanlogin=$PG_POSTGRES_CANLOGIN"
+        echo "rolsuper=$PG_POSTGRES_SUPERUSER"
+        echo "backup_changed_rolcanlogin=no"
+      } > "$PG_DEFAULT_ROLE_FILE"
+      if [[ "$PG_POSTGRES_CANLOGIN" != "t" ]]; then
+        log "PostgreSQL default role 'postgres' is disabled for LOGIN; enabling it for disaster recovery."
+        psql -AtX -d "$PGDATABASE" -c "ALTER ROLE postgres LOGIN;" >/dev/null
+        echo "backup_changed_rolcanlogin=yes" >> "$PG_DEFAULT_ROLE_FILE"
+      fi
+    else
+      {
+        echo "role=postgres"
+        echo "status=NOT_PRESENT"
+      } > "$PG_DEFAULT_ROLE_FILE"
+    fi
+
     log "Dumping ALL PostgreSQL database names..."
     if ! psql -AtX -d "$PGDATABASE" \
       -c 'SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY 1;' \
@@ -477,8 +642,23 @@ if cmd mongodump || cmd mongosh || [[ -d /etc/mongod.conf.d ]] || [[ -f /etc/mon
       fi
     fi
     if cmd mongosh; then
+      mongosh "$MONGO_URI" --quiet --eval 'db.version()' \
+        > "$TREE/MONGODB/server-version.txt" 2>/dev/null || true
+      mongosh "$MONGO_URI" --quiet --eval 'db.adminCommand({getCmdLineOpts:1}).parsed.security || {}' \
+        > "$TREE/MONGODB/security-config.txt" 2>/dev/null || true
       mongosh "$MONGO_URI" --quiet --eval 'db.adminCommand({listDatabases:1}).databases.map(x=>x.name).join("\n")' \
         > "$TREE/MONGODB/database-list.txt" 2>/dev/null || true
+
+      # MongoDB has no single built-in default account. Back up every user's
+      # roles/privileges so accounts can be recreated on the new server.
+      : > "$TREE/MONGODB/users.json"
+      while IFS= read -r mdb; do
+        [[ -n "$mdb" ]] || continue
+        printf '\n===== DATABASE: %s =====\n' "$mdb" >> "$TREE/MONGODB/users.json"
+        mongosh "mongodb://${AUTH_STR}${MONGO_HOST}:${MONGO_PORT}/${mdb}${AUTH_DB_STR}" \
+          --quiet --eval 'EJSON.stringify(db.getUsers({showCredentials:false}), null, 2)' \
+          >> "$TREE/MONGODB/users.json" 2>/dev/null || true
+      done < "$TREE/MONGODB/database-list.txt"
     fi
   else
     log "MongoDB is not listening on ${MONGO_HOST}:${MONGO_PORT}. Skipping live dump."
@@ -516,6 +696,28 @@ if cmd sqlcmd || systemctl list-unit-files 2>/dev/null | grep -q '^mssql-server\
       > "$TREE/MSSQL/version.txt" 2>&1; then
     die "MSSQL connection/authentication failed. Aborting backup."
   fi
+
+  # Record the built-in SQL Server 'sa' login and enable it for recovery if disabled.
+  # Original state is retained so restore can put it back.
+  SA_STATE="$(sqlcmd "${SQLCMD_ARGS[@]}" -h -1 -W -Q \
+    "SET NOCOUNT ON; SELECT CAST(is_disabled AS int) FROM sys.sql_logins WHERE name = N'sa';" \
+    2>/dev/null | sed '/^[[:space:]]*$/d' | head -n 1 | tr -d '[:space:]')"
+  {
+    echo "login=sa"
+    echo "original_is_disabled=${SA_STATE:-UNKNOWN}"
+    echo "backup_changed_is_disabled=no"
+  } > "$TREE/MSSQL/sa-login-state.txt"
+  if [[ "$SA_STATE" == "1" ]]; then
+    log "MSSQL built-in 'sa' login is disabled; enabling it for disaster recovery."
+    sqlcmd "${SQLCMD_ARGS[@]}" -Q "ALTER LOGIN [sa] ENABLE;" >/dev/null
+    echo "backup_changed_is_disabled=yes" >> "$TREE/MSSQL/sa-login-state.txt"
+  fi
+
+  # Export server login state. Database users/roles are preserved by the .bak files.
+  sqlcmd "${SQLCMD_ARGS[@]}" -h -1 -W -Q "SET NOCOUNT ON; SELECT name, type_desc, is_disabled FROM sys.server_principals WHERE type IN ('S','U') ORDER BY name;" \
+    > "$TREE/MSSQL/server-logins.txt" 2>/dev/null || true
+  sqlcmd "${SQLCMD_ARGS[@]}" -h -1 -W -Q "SET NOCOUNT ON; SELECT r.name AS server_role, m.name AS member_name FROM sys.server_role_members srm JOIN sys.server_principals r ON r.principal_id=srm.role_principal_id JOIN sys.server_principals m ON m.principal_id=srm.member_principal_id ORDER BY r.name,m.name;" \
+    > "$TREE/MSSQL/server-role-members.txt" 2>/dev/null || true
 
   # SQL Server Express does not support BACKUP DATABASE ... COMPRESSION.
   # Detect the edition once and choose a compatible BACKUP option set.
@@ -627,6 +829,40 @@ if cmd sqlcmd || systemctl list-unit-files 2>/dev/null | grep -q '^mssql-server\
   unset MSSQL_PASSWORD
 fi
 
+# ---------- Consolidated restore metadata ----------
+record_tool_metadata
+
+if [[ -f "$TREE/POSTGRES/postgres-role-state.txt" ]]; then
+  {
+    echo
+    echo "[postgresql_restore_state]"
+    cat "$TREE/POSTGRES/postgres-role-state.txt"
+  } >> "$TREE/METADATA/tool-versions.txt"
+fi
+if [[ -f "$TREE/MSSQL/version.txt" ]]; then
+  {
+    echo
+    echo "[mssql_server]"
+    sed -n '1,3p' "$TREE/MSSQL/version.txt"
+    [[ -f "$TREE/MSSQL/edition.txt" ]] && echo "edition=$(cat "$TREE/MSSQL/edition.txt")"
+  } >> "$TREE/METADATA/tool-versions.txt"
+fi
+if [[ -f "$TREE/POSTGRES/server-version.txt" ]]; then
+  {
+    echo
+    echo "[postgresql_server]"
+    echo "server_version=$(cat "$TREE/POSTGRES/server-version.txt")"
+    echo "server_version_num=$(cat "$TREE/POSTGRES/server-version-num.txt")"
+  } >> "$TREE/METADATA/tool-versions.txt"
+fi
+if [[ -f "$TREE/MONGODB/server-version.txt" ]]; then
+  {
+    echo
+    echo "[mongodb_server]"
+    echo "server_version=$(cat "$TREE/MONGODB/server-version.txt")"
+  } >> "$TREE/METADATA/tool-versions.txt"
+fi
+
 # ---------- Docker ----------
 if cmd docker; then
   docker version > "$TREE/DOCKER/docker-version.txt" 2>&1 || true
@@ -694,11 +930,140 @@ find /var/www /opt /srv -type d -name .git -prune -print 2>/dev/null |
     echo "MSSQL Edition: $(cat "$TREE/MSSQL/edition.txt")"
   fi
   echo
+  echo "Consolidated restore metadata: METADATA/tool-versions.txt"
+  echo "Machine-readable metadata: METADATA/tool-versions.env"
+  echo
   echo "Detected commands:"
   for x in nginx psql pg_dump pg_dumpall pg_isready mongodump mongosh sqlcmd docker cscli ufw dotnet pacman dpkg; do
     printf '%-12s %s\n' "$x" "$(command -v "$x" 2>/dev/null || echo NOT-INSTALLED)"
   done
 } > "$TREE/backup-info.txt"
+
+# ---------- Restore helper ----------
+mkdir -p "$TREE/RESTORE"
+cat > "$TREE/RESTORE/README.txt" <<'EOF_README'
+DISASTER RECOVERY RESTORE GUIDE
+
+1. Read METADATA/tool-versions.txt first. It contains the exact installed tool/package versions captured during backup.
+2. Install the required major versions before restoring data. For PostgreSQL use the captured PostgreSQL server major version, not the Ubuntu default repository version.
+3. Restore PostgreSQL roles first from POSTGRES/globals.sql, then restore each POSTGRES/databases/*.dump with pg_restore.
+4. Restore MSSQL server login state from MSSQL/server-logins.txt as required, then restore MSSQL/bak/*.bak. The original sa enabled/disabled state is in MSSQL/sa-login-state.txt.
+5. Restore MongoDB configuration and database data. MongoDB users/roles are in MONGODB/users.json. Passwords are intentionally not stored in clear text; recreate/reset user passwords during restore.
+6. Restore Nginx from NGINX/etc-nginx and validate with nginx -t before starting it.
+7. Restore CrowdSec from CROWDSEC/etc-crowdsec and validate cscli configuration before starting it.
+
+IMPORTANT: Do not blindly enable built-in accounts on the restored production server. If this backup had to enable postgres or sa for collection, restore the original state recorded in their state files after recovery and verification.
+EOF_README
+
+cat > "$TREE/RESTORE/check-versions.sh" <<'EOF_CHECK'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+BASE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+META="$BASE/METADATA/tool-versions.env"
+[[ -f "$META" ]] || { echo "Missing $META" >&2; exit 1; }
+# shellcheck disable=SC1090
+. "$META"
+echo "Backup OS: $OS_PRETTY_NAME ($OS_ID $OS_VERSION)"
+echo "Backup kernel: $KERNEL / $ARCH"
+echo
+printf '%-18s %-32s %s\n' TOOL EXPECTED INSTALLED
+printf '%-18s %-32s %s\n' "----" "--------" "---------"
+check_cmd(){
+  local name="$1" expected="$2" cmd_name="${3:-$1}" got
+  if command -v "$cmd_name" >/dev/null 2>&1; then
+    got="$($cmd_name --version 2>&1 | head -n1 || true)"
+  else
+    got="NOT-INSTALLED"
+  fi
+  printf '%-18s %-32s %s\n' "$name" "$expected" "$got"
+}
+check_cmd nginx "${NGINX_VERSION:-unknown}" nginx
+check_cmd postgres-client "${PSQL_VERSION:-unknown}" psql
+check_cmd mongodb-shell "${MONGOSH_VERSION:-unknown}" mongosh
+check_cmd crowdsec "${CROWDSEC_VERSION:-unknown}" cscli
+check_cmd sqlcmd "${SQLCMD_VERSION:-unknown}" sqlcmd
+EOF_CHECK
+chmod 700 "$TREE/RESTORE/check-versions.sh"
+
+
+cat > "$TREE/RESTORE/restore-apt-sources.sh" <<'EOF_APT_RESTORE'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+BASE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+APT_BACKUP="$BASE/APT"
+[[ -d "$APT_BACKUP" ]] || { echo "No APT metadata in this backup." >&2; exit 1; }
+[[ $EUID -eq 0 ]] || { echo "Run as root." >&2; exit 1; }
+
+mkdir -p /etc/apt/sources.list.d /etc/apt/keyrings /etc/apt/trusted.gpg.d /etc/apt/preferences.d /usr/share/keyrings
+
+# Preserve the new machine's current configuration before replacing it.
+STAMP="$(date +%Y%m%d_%H%M%S)"
+if [[ -f /etc/apt/sources.list ]]; then cp -a /etc/apt/sources.list "/etc/apt/sources.list.pre-restore-$STAMP"; fi
+if [[ -d /etc/apt/sources.list.d ]]; then cp -a /etc/apt/sources.list.d "/etc/apt/sources.list.d.pre-restore-$STAMP"; fi
+
+[[ ! -f "$APT_BACKUP/sources.list" ]] || cp -a "$APT_BACKUP/sources.list" /etc/apt/sources.list
+if [[ -d "$APT_BACKUP/sources.list.d" ]]; then
+  find /etc/apt/sources.list.d -maxdepth 1 -type f \
+    \( -name '*.list' -o -name '*.sources' \) -delete 2>/dev/null || true
+  cp -a "$APT_BACKUP/sources.list.d/." /etc/apt/sources.list.d/
+fi
+if [[ -d "$APT_BACKUP/keyrings" ]]; then cp -a "$APT_BACKUP/keyrings/." /usr/share/keyrings/; cp -a "$APT_BACKUP/keyrings/." /etc/apt/keyrings/ 2>/dev/null || true; fi
+if [[ -d "$APT_BACKUP/trusted.gpg.d" ]]; then cp -a "$APT_BACKUP/trusted.gpg.d/." /etc/apt/trusted.gpg.d/; fi
+if [[ -f "$APT_BACKUP/trusted.gpg" ]]; then cp -a "$APT_BACKUP/trusted.gpg" /etc/apt/trusted.gpg; fi
+if [[ -d "$APT_BACKUP/preferences.d" ]]; then cp -a "$APT_BACKUP/preferences.d/." /etc/apt/preferences.d/; fi
+
+echo "Restored APT sources and signing keys from backup."
+echo "Running apt-get update..."
+apt-get update
+EOF_APT_RESTORE
+chmod 700 "$TREE/RESTORE/restore-apt-sources.sh"
+
+cat > "$TREE/RESTORE/install-packages-exact.sh" <<'EOF_INSTALL'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+BASE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+META="$BASE/METADATA/tool-versions.txt"
+[[ -f "$META" ]] || { echo "Missing metadata: $META" >&2; exit 1; }
+[[ $EUID -eq 0 ]] || { echo "Run as root." >&2; exit 1; }
+
+if command -v apt-get >/dev/null 2>&1 && command -v dpkg-query >/dev/null 2>&1; then
+  # FIRST restore the exact repository definitions and signing keys captured
+  # from the old server. This is what allows vendor packages such as PGDG,
+  # Microsoft SQL Server and MongoDB to resolve to the recorded versions.
+  "$BASE/RESTORE/restore-apt-sources.sh"
+
+  echo "Attempting exact Debian/Ubuntu package versions recorded in the backup."
+  awk -F '\\t' '/^nginx\\t|^nginx-common\\t|^postgresql\\t|^postgresql-common\\t|^postgresql-client\\t|^mssql-server\\t|^mongodb-org\\t|^mongodb-org-server\\t|^mongodb-database-tools\\t|^crowdsec\\t|^crowdsec-firewall-bouncer\\t|^fail2ban\\t|^docker-ce\\t|^docker.io\\t/ {print $1 "=" $2}' "$META" |
+  while IFS= read -r pkgver; do
+    [[ -n "$pkgver" ]] || continue
+    pkg="${pkgver%%=*}"
+    ver="${pkgver#*=}"
+    echo "Installing $pkg=$ver"
+    apt-get install -y "${pkg}=${ver}" || { echo "ERROR: exact package unavailable: ${pkg}=${ver}" >&2; exit 1; }
+  done
+else
+  echo "This helper currently targets Debian/Ubuntu apt packages." >&2
+  echo "Use METADATA/tool-versions.txt with the native package manager on another distribution." >&2
+  exit 2
+fi
+EOF_INSTALL
+chmod 700 "$TREE/RESTORE/install-packages-exact.sh"
+
+cat > "$TREE/RESTORE/restore-original-account-state.sql.txt" <<'EOF_ACCOUNTS'
+ACCOUNT STATE RESTORE NOTES
+
+PostgreSQL:
+  See POSTGRES/postgres-role-state.txt.
+  If original_rolcanlogin was 'f', run as a PostgreSQL superuser:
+    ALTER ROLE postgres NOLOGIN;
+
+MSSQL:
+  See MSSQL/sa-login-state.txt.
+  If original_is_disabled was '1', run as sysadmin:
+    ALTER LOGIN [sa] DISABLE;
+
+These commands intentionally are NOT executed automatically.
+EOF_ACCOUNTS
 
 # ---------- Archive integrity ----------
 log "Creating archive"
