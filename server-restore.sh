@@ -971,9 +971,15 @@ install_exact_apt_packages() {
     fi
 
     # PostgreSQL
-    if [[ "$RESTORE_POSTGRES" == 1 ]]; then
-        add_matches '^postgresql($|-)|^postgresql-common$'
-    fi
+ # PostgreSQL
+if [[ "$RESTORE_POSTGRES" == 1 ]]; then
+    sed -i '/^postgresql-/d' "$tmp"
+    sed -i '/^postgresql-common$/d' "$tmp"
+
+    printf '%s\t%s\n' "postgresql-18" "FORCED-18" >> "$tmp"
+    printf '%s\t%s\n' "postgresql-client-18" "FORCED-18" >> "$tmp"
+    printf '%s\t%s\n' "postgresql-common" "FORCED-18" >> "$tmp"
+fi
 
     # MongoDB
     if [[ "$RESTORE_MONGO" == 1 ]]; then
