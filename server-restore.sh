@@ -738,13 +738,14 @@ install_base_tools_apt() {
 }
 
 install_postgres_ubuntu_official() {
-    local version="${PG_VERSION:-18}"
+    local version=18
     local key="/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc"
     local repo="/etc/apt/sources.list.d/pgdg.sources"
 
-    log "PostgreSQL: configuring official PGDG repository."
+    log "PostgreSQL: installing PostgreSQL ${version} from official PGDG repository."
 
-    apt-get install -y postgresql-common
+    apt-get install -y postgresql-common curl ca-certificates
+
     install -d -m 0755 /usr/share/postgresql-common/pgdg
 
     curl -fsSL \
@@ -753,17 +754,11 @@ install_postgres_ubuntu_official() {
 
     chmod 0644 "$key"
 
-    local pg_arch
-    case "$ARCH" in
-        amd64|arm64) pg_arch="$ARCH" ;;
-        *) die "Unsupported PostgreSQL PGDG architecture: $ARCH" ;;
-    esac
-
     cat > "$repo" <<EOF
 Types: deb
 URIs: https://apt.postgresql.org/pub/repos/apt
 Suites: ${OS_CODENAME}-pgdg
-Architectures: ${pg_arch}
+Architectures: ${ARCH}
 Components: main
 Signed-By: ${key}
 EOF
@@ -771,7 +766,12 @@ EOF
     chmod 0644 "$repo"
 
     apt-get update
-    apt-get install -y "postgresql-${version}" "postgresql-client-${version}"
+
+    apt-get install -y \
+        "postgresql-${version}" \
+        "postgresql-client-${version}"
+
+    log "PostgreSQL ${version} installed from official PGDG repository."
 }
 
 install_postgres() {
@@ -971,16 +971,9 @@ install_exact_apt_packages() {
     fi
 
     # PostgreSQL
- # PostgreSQL
-if [[ "$RESTORE_POSTGRES" == 1 ]]; then
-    sed -i '/^postgresql-/d' "$tmp"
-    sed -i '/^postgresql-common$/d' "$tmp"
-
-    printf '%s\t%s\n' "postgresql-18" "FORCED-18" >> "$tmp"
-    printf '%s\t%s\n' "postgresql-client-18" "FORCED-18" >> "$tmp"
-    printf '%s\t%s\n' "postgresql-common" "FORCED-18" >> "$tmp"
-fi
-
+    if [[ "$RESTORE_POSTGRES" == 1 ]]; then
+        install_postgres_ubuntu_official
+    fi
     # MongoDB
     if [[ "$RESTORE_MONGO" == 1 ]]; then
         add_matches '^mongodb-'
